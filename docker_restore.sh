@@ -26,6 +26,7 @@
 
 # Default configuration
 DEFAULT_BACKUP_DIR="/backup/docker"
+MINIMUM_FREE_SPACE_MB=500  # Minimum required free space in MB
 
 # Parse command line arguments
 usage() {
@@ -53,6 +54,9 @@ SPECIFIC_DATE=""
 FORCE=false
 VOLUME_ARG=""
 
+# Map for tracking containers to restart
+declare -A STOPPED_CONTAINERS
+
 # Parse command line options
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -62,6 +66,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     -b|--backup)
       SPECIFIC_DATE="$2"
+      # Validate date format (YYYY-MM-DD)
+      if ! [[ "$SPECIFIC_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo "ERROR: Invalid date format. Please use YYYY-MM-DD format."
+        exit 1
+      fi
       shift 2
       ;;
     -f|--force)
@@ -82,12 +91,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-LOG_FILE="$BACKUP_DIR/docker_backup.log"
+LOG_FILE="$BACKUP_DIR/docker_restore.log"
+
+# Logging function
+log() {
+  local level="$1"
+  local message="$2"
+  local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
 
 # Verify that the script is executed with necessary permissions
 verify_permissions() {
   # Check if the user can execute docker commands
   if ! docker ps > /dev/null 2>&1; then
+    log "ERROR" "Current user cannot execute Docker commands."
     echo "ERROR: Current user cannot execute Docker commands."
     echo "Make sure you are in the 'docker' group or are root:"
     echo "sudo usermod -aG docker $USER"
@@ -97,20 +115,55 @@ verify_permissions() {
   
   # Check if backup directory exists
   if [ ! -d "$BACKUP_DIR" ]; then
+    log "ERROR" "Backup directory $BACKUP_DIR does not exist."
     echo "ERROR: Backup directory $BACKUP_DIR does not exist."
     echo "Please check the path or create it first."
     exit 1
   fi
   
-  echo "Necessary permissions verified. Continuing script execution..."
+  log "INFO" "Necessary permissions verified."
 }
 
-# Logging function
-log() {
-  local level="$1"
-  local message="$2"
-  local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-  echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+# Check available disk space for restoration
+check_disk_space() {
+  local volume="$1"
+  local backup_file="$2"
+  
+  log "INFO" "Checking available disk space for restoration"
+  
+  # Get backup file size in MB
+  local backup_size_mb=$(du -m "$backup_file" | cut -f1)
+  
+  # Add 30% overhead for extraction
+  local needed_space=$((backup_size_mb + (backup_size_mb * 30 / 100)))
+  
+  # Get available space
+  local docker_root=$(docker info --format '{{.DockerRootDir}}')
+  local available_space=$(df -m "$docker_root" | awk 'NR==2 {print $4}')
+  
+  log "INFO" "Backup size: $backup_size_mb MB"
+  log "INFO" "Estimated space needed: $needed_space MB"
+  log "INFO" "Available space: $available_space MB"
+  
+  if [ "$available_space" -lt "$needed_space" ]; then
+    log "ERROR" "Insufficient disk space for restoration"
+    echo "ERROR: Insufficient disk space for restoration"
+    echo "Backup size: $backup_size_mb MB"
+    echo "Estimated space needed: $needed_space MB"
+    echo "Available space: $available_space MB"
+    
+    if [ "$FORCE" != "true" ]; then
+      read -p "Available space may be insufficient. Continue anyway? (y/n): " confirm
+      if [ "$confirm" != "y" ]; then
+        log "INFO" "Restoration canceled by user due to space concerns"
+        return 1
+      fi
+    fi
+    
+    log "WARNING" "Continuing restoration despite potential space issues"
+  fi
+  
+  return 0
 }
 
 # Create log file if it doesn't exist
@@ -131,6 +184,19 @@ verify_backup() {
   
   log "INFO" "Verifying backup integrity: $backup_file"
   
+  # Check if file exists
+  if [ ! -f "$backup_file" ]; then
+    log "ERROR" "Backup file not found: $backup_file"
+    return 1
+  fi
+  
+  # Verify the backup file is not empty
+  local file_size=$(stat -c%s "$backup_file")
+  if [ "$file_size" -eq 0 ]; then
+    log "ERROR" "Backup file is empty: $backup_file"
+    return 1
+  fi
+  
   # Verify integrity of tar archive with pigz if available
   if ! docker run --rm \
     -v "$backup_dir:/backup_dir" \
@@ -139,174 +205,222 @@ verify_backup() {
     return 1
   fi
   
-  log "INFO" "Integrity verification completed successfully"
+  # Check that the archive contains files
+  local file_count=$(docker run --rm \
+    -v "$backup_dir:/backup_dir" \
+    alpine sh -c "tar -tzf /backup_dir/$backup_rel_path | wc -l")
+  
+  if [ "$file_count" -lt 1 ]; then
+    log "ERROR" "Backup archive appears to be empty (no files found inside)"
+    return 1
+  fi
+  
+  log "INFO" "Integrity verification completed successfully (found $file_count files/directories)"
   return 0
 }
 
 # Function to show available backup dates
 show_available_dates() {
   log "INFO" "Searching for available backup dates"
-  echo "Available backup dates:"
-  echo "-------------------------"
   
   # Find all backup directories sorted by date (most recent first)
-  BACKUP_DATES=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | sort -r)
+  local backup_dates=()
+  while IFS= read -r date_dir; do
+    if [ -d "$date_dir" ]; then
+      backup_dates+=("$date_dir")
+    fi
+  done < <(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | sort -r)
   
-  if [ -z "$BACKUP_DATES" ]; then
+  if [ ${#backup_dates[@]} -eq 0 ]; then
     log "WARNING" "No backup directories found in $BACKUP_DIR"
     echo "No backups found in $BACKUP_DIR"
     exit 1
   fi
   
   # Show dates with numbers
-  COUNT=1
-  for DATE_DIR in $BACKUP_DATES; do
-    DATE_NAME=$(basename "$DATE_DIR")
-    echo "$COUNT) Backup from $DATE_NAME"
-    COUNT=$((COUNT+1))
+  echo "Available backup dates:"
+  echo "-------------------------"
+  local count=1
+  for date_dir in "${backup_dates[@]}"; do
+    local date_name=$(basename "$date_dir")
+    echo "$count) Backup from $date_name"
+    count=$((count+1))
   done
   
-  return $COUNT
+  # Return the array of backup dates
+  echo "${backup_dates[@]}"
 }
 
 # Function to show list of available volumes for restoration on a specific date
 show_available_volumes() {
-  BACKUP_DATE=$1
-  BACKUP_DATE_DIR="$BACKUP_DIR/$BACKUP_DATE"
+  local backup_date_dir="$1"
   
-  log "INFO" "Searching for available volumes for restoration on date $BACKUP_DATE"
-  echo "Volumes available for restoration from $BACKUP_DATE:"
-  echo "------------------------------------"
+  log "INFO" "Searching for available volumes for restoration in $backup_date_dir"
   
   # Extract unique volume names from backup files
-  AVAILABLE_VOLUMES=$(find "$BACKUP_DATE_DIR" -name "*.tar.gz" -type f | xargs -n1 basename | sed 's/.tar.gz$//')
+  local available_volumes=()
+  while IFS= read -r volume_file; do
+    if [ -f "$volume_file" ]; then
+      local volume_name=$(basename "$volume_file" .tar.gz)
+      available_volumes+=("$volume_name")
+    fi
+  done < <(find "$backup_date_dir" -name "*.tar.gz" -type f | sort)
   
-  if [ -z "$AVAILABLE_VOLUMES" ]; then
-    log "WARNING" "No backups found in $BACKUP_DATE_DIR"
-    echo "No backups found in $BACKUP_DATE_DIR"
+  if [ ${#available_volumes[@]} -eq 0 ]; then
+    log "WARNING" "No backups found in $backup_date_dir"
+    echo "No backups found in $backup_date_dir"
     exit 1
   fi
   
   # Show volumes with numbers
-  COUNT=1
-  for VOL in $AVAILABLE_VOLUMES; do
-    echo "$COUNT) $VOL"
-    COUNT=$((COUNT+1))
+  local backup_date=$(basename "$backup_date_dir")
+  echo "Volumes available for restoration from $backup_date:"
+  echo "------------------------------------"
+  local count=1
+  for vol in "${available_volumes[@]}"; do
+    # Get file size
+    local size=$(du -h "$backup_date_dir/$vol.tar.gz" | cut -f1)
+    echo "$count) $vol (Size: $size)"
+    count=$((count+1))
   done
   
-  return $COUNT
+  # Return the array of available volumes
+  echo "${available_volumes[@]}"
 }
 
-# Function to show available backups for a volume on a specific date
-show_available_backups() {
-  BACKUP_DATE=$1
-  VOLUME=$2
-  BACKUP_DATE_DIR="$BACKUP_DIR/$BACKUP_DATE"
+# Function to stop containers using a volume
+stop_containers() {
+  local volume="$1"
   
-  log "INFO" "Searching for available backups for volume $VOLUME on date $BACKUP_DATE"
-  echo "Available backups for volume $VOLUME from $BACKUP_DATE:"
-  echo "----------------------------------------"
+  # Find all containers using this volume
+  local containers=$(docker ps -a --filter volume="$volume" --format "{{.Names}}")
   
-  # Find the backup for this volume on the specified date
-  BACKUP="$BACKUP_DATE_DIR/$VOLUME.tar.gz"
-  
-  if [ ! -f "$BACKUP" ]; then
-    log "WARNING" "No backup found for volume $VOLUME on date $BACKUP_DATE"
-    echo "No backup found for volume $VOLUME on date $BACKUP_DATE"
-    exit 1
+  if [ -z "$containers" ]; then
+    log "INFO" "No containers are using volume $volume"
+    return 0
   fi
   
-  # Get backup size
-  SIZE=$(du -h "$BACKUP" | cut -f1)
+  # Find running containers
+  local running_containers=$(docker ps --filter volume="$volume" --format "{{.Names}}")
   
-  echo "Available backup - Size: $SIZE"
+  if [ -z "$running_containers" ]; then
+    log "INFO" "No running containers are using volume $volume"
+    return 0
+  fi
   
-  # Return 2 because we have only one option (1) plus exit (0)
-  return 2
+  log "INFO" "Running containers using volume $volume: $running_containers"
+  echo "Running containers using volume $volume: $running_containers"
+  
+  # Ask for confirmation unless force mode is enabled
+  if [ "$FORCE" != "true" ]; then
+    read -p "These containers will be stopped during restoration. Continue? (y/n): " confirm
+    if [ "$confirm" != "y" ]; then
+      log "INFO" "Restoration canceled by user"
+      echo "Restoration canceled."
+      exit 0
+    fi
+  else
+    log "INFO" "Force mode enabled, skipping container stop confirmation"
+  fi
+  
+  # Stop containers
+  log "INFO" "Stopping containers..."
+  echo "Stopping containers..."
+  
+  for container in $running_containers; do
+    if docker stop "$container"; then
+      log "INFO" "Container $container stopped"
+      echo "Container $container stopped"
+      # Add to the list of containers to restart
+      STOPPED_CONTAINERS["$container"]="$volume"
+    else
+      log "ERROR" "Unable to stop container $container"
+      echo "Error: unable to stop container $container"
+      
+      # If force is enabled, continue anyway
+      if [ "$FORCE" != "true" ]; then
+        read -p "Continue anyway? (y/n): " confirm
+        if [ "$confirm" != "y" ]; then
+          log "INFO" "Restoration canceled by user"
+          echo "Restoration canceled."
+          exit 0
+        fi
+      fi
+    fi
+  done
+  
+  return 0
 }
+
+# Function to restart containers that were stopped
+restart_containers() {
+  if [ ${#STOPPED_CONTAINERS[@]} -eq 0 ]; then
+    return 0
+  fi
+  
+  log "INFO" "Restarting containers..."
+  echo "Restarting containers..."
+  
+  for container in "${!STOPPED_CONTAINERS[@]}"; do
+    if docker start "$container"; then
+      log "INFO" "Container $container restarted"
+      echo "Container $container restarted"
+    else
+      log "ERROR" "Unable to restart container $container"
+      echo "Error: unable to restart container $container"
+      log "WARNING" "Manual intervention required to restart container: $container"
+    fi
+  done
+}
+
+# Function to ensure containers are restarted on script exit or error
+cleanup_on_exit() {
+  log "INFO" "Running cleanup on exit..."
+  restart_containers
+  log "INFO" "Cleanup completed"
+}
+
+# Register trap for cleanup
+trap cleanup_on_exit EXIT INT TERM
 
 # Function to restore a volume
 restore_volume() {
-  VOLUME=$1
-  BACKUP_FILE=$2
+  local volume="$1"
+  local backup_file="$2"
   
   log "INFO" "===========================================" 
   log "INFO" "Starting restoration procedure"
-  log "INFO" "Volume: $VOLUME"
-  log "INFO" "Backup file: $BACKUP_FILE"
+  log "INFO" "Volume: $volume"
+  log "INFO" "Backup file: $backup_file"
   
   # Verify backup integrity before restoration
-  if ! verify_backup "$BACKUP_FILE"; then
+  if ! verify_backup "$backup_file"; then
     log "ERROR" "Integrity verification failed. Restoration canceled."
     echo "Integrity verification failed. Restoration canceled."
     exit 1
   fi
   
-  log "INFO" "Restoring volume $VOLUME from backup: $BACKUP_FILE"
-  echo "Restoring volume $VOLUME from backup: $BACKUP_FILE"
-  
-  # Find containers using this volume
-  CONTAINERS=$(docker ps -a --filter volume=$VOLUME --format "{{.Names}}")
-  RUNNING_CONTAINERS=$(docker ps --filter volume=$VOLUME --format "{{.Names}}")
-  
-  # If there are containers using this volume, stop them
-  if [ ! -z "$CONTAINERS" ]; then
-    log "INFO" "Containers using volume $VOLUME: $CONTAINERS"
-    echo "Containers using volume $VOLUME: $CONTAINERS"
-    
-    if [ ! -z "$RUNNING_CONTAINERS" ]; then
-      log "INFO" "Running containers using volume $VOLUME: $RUNNING_CONTAINERS"
-      echo "Running containers using volume $VOLUME: $RUNNING_CONTAINERS"
-      
-      # Ask for confirmation unless force mode is enabled
-      if [ "$FORCE" != "true" ]; then
-        read -p "These containers will be stopped during restoration. Continue? (y/n): " CONFIRM
-        if [ "$CONFIRM" != "y" ]; then
-          log "INFO" "Restoration canceled by user"
-          echo "Restoration canceled."
-          exit 0
-        fi
-      else
-        log "INFO" "Force mode enabled, skipping container stop confirmation"
-      fi
-      
-      # Stop containers
-      log "INFO" "Stopping containers..."
-      echo "Stopping containers..."
-      for CONTAINER in $RUNNING_CONTAINERS; do
-        if docker stop $CONTAINER; then
-          log "INFO" "Container $CONTAINER stopped"
-          echo "Container $CONTAINER stopped"
-        else
-          log "ERROR" "Unable to stop container $CONTAINER"
-          echo "Error: unable to stop container $CONTAINER"
-          
-          # If force is enabled, continue anyway
-          if [ "$FORCE" != "true" ]; then
-            read -p "Continue anyway? (y/n): " CONFIRM
-            if [ "$CONFIRM" != "y" ]; then
-              log "INFO" "Restoration canceled by user"
-              echo "Restoration canceled."
-              exit 0
-            fi
-          fi
-        fi
-      done
-    else
-      log "INFO" "No running containers are using volume $VOLUME"
-    fi
+  # Check disk space
+  if ! check_disk_space "$volume" "$backup_file"; then
+    exit 1
   fi
   
+  log "INFO" "Restoring volume $volume from backup: $backup_file"
+  echo "Restoring volume $volume from backup: $backup_file"
+  
+  # Stop containers using the volume
+  stop_containers "$volume"
+  
   # Create volume if it doesn't exist
-  if ! docker volume inspect $VOLUME >/dev/null 2>&1; then
-    log "INFO" "Volume $VOLUME does not exist. Creating..."
-    echo "Volume $VOLUME does not exist. Creating..."
-    if docker volume create $VOLUME; then
-      log "INFO" "Volume $VOLUME created successfully"
-      echo "Volume $VOLUME created successfully"
+  if ! docker volume inspect "$volume" >/dev/null 2>&1; then
+    log "INFO" "Volume $volume does not exist. Creating..."
+    echo "Volume $volume does not exist. Creating..."
+    if docker volume create "$volume"; then
+      log "INFO" "Volume $volume created successfully"
+      echo "Volume $volume created successfully"
     else
-      log "ERROR" "Unable to create volume $VOLUME"
-      echo "Error: unable to create volume $VOLUME"
+      log "ERROR" "Unable to create volume $volume"
+      echo "Error: unable to create volume $volume"
       exit 1
     fi
   fi
@@ -315,16 +429,52 @@ restore_volume() {
   START_TIME=$(date +%s)
   
   # Get the directory containing the backup file
-  BACKUP_DIR_PATH=$(dirname "$BACKUP_FILE")
-  BACKUP_FILENAME=$(basename "$BACKUP_FILE")
+  BACKUP_DIR_PATH=$(dirname "$backup_file")
+  BACKUP_FILENAME=$(basename "$backup_file")
   
-  # Restore backup with pigz for faster speed
-  log "INFO" "Restoring data in progress... (this may take time)"
-  echo "Restoring data in progress... (this may take time)"
-  if docker run --rm \
-    -v $VOLUME:/target \
-    -v $BACKUP_DIR_PATH:/backup_src \
+  # Create a temporary volume for safety
+  local temp_volume="temp_restore_${volume}_$(date +%s)"
+  log "INFO" "Creating temporary volume for safe restoration: $temp_volume"
+  
+  if ! docker volume create "$temp_volume"; then
+    log "ERROR" "Unable to create temporary volume $temp_volume"
+    echo "Error: unable to create temporary volume for safe restoration"
+    exit 1
+  fi
+  
+  # First restore to temporary volume to verify it works
+  log "INFO" "First restoring to temporary volume..."
+  if ! docker run --rm \
+    -v "$temp_volume:/target" \
+    -v "$BACKUP_DIR_PATH:/backup_src" \
     alpine sh -c "apk add --no-cache pigz && pigz -dc /backup_src/$BACKUP_FILENAME | tar -xf - -C /target || tar -xzf /backup_src/$BACKUP_FILENAME -C /target"; then
+    
+    log "ERROR" "Error during test restoration to temporary volume"
+    echo "Error during test restoration to temporary volume"
+    
+    # Clean up temporary volume
+    docker volume rm "$temp_volume"
+    exit 1
+  fi
+  
+  # Verify temp restoration
+  local items_count=$(docker run --rm -v "$temp_volume:/target" alpine sh -c "find /target -type f | wc -l")
+  log "INFO" "Test restoration successful: $items_count files extracted to temporary volume"
+  
+  # Now restore to actual volume
+  log "INFO" "Restoring data to actual volume in progress... (this may take time)"
+  echo "Restoring data in progress... (this may take time)"
+  
+  # First clear the target volume to ensure clean state
+  if ! docker run --rm -v "$volume:/target" alpine sh -c "rm -rf /target/*"; then
+    log "WARNING" "Unable to clean target volume before restoration. Continuing anyway."
+  fi
+  
+  # Copy from temp volume to actual volume
+  if docker run --rm \
+    -v "$temp_volume:/source" \
+    -v "$volume:/target" \
+    alpine sh -c "cp -a /source/. /target/"; then
     
     # Calculate restoration time
     END_TIME=$(date +%s)
@@ -334,46 +484,24 @@ restore_volume() {
     echo "Restoration completed in $DURATION seconds"
     
     # Verify contents after restoration
-    ITEMS_COUNT=$(docker run --rm -v $VOLUME:/target alpine sh -c "find /target -type f | wc -l")
-    log "INFO" "Items restored in volume $VOLUME: $ITEMS_COUNT files"
-    echo "Items restored in volume $VOLUME: $ITEMS_COUNT files"
+    ITEMS_COUNT=$(docker run --rm -v "$volume:/target" alpine sh -c "find /target -type f | wc -l")
+    log "INFO" "Items restored in volume $volume: $ITEMS_COUNT files"
+    echo "Items restored in volume $volume: $ITEMS_COUNT files"
+    
+    # Remove temporary volume
+    if docker volume rm "$temp_volume"; then
+      log "INFO" "Temporary volume removed"
+    else
+      log "WARNING" "Unable to remove temporary volume $temp_volume. Manual cleanup may be needed."
+    fi
   else
     log "ERROR" "Error during data restoration"
     echo "Error during data restoration"
     
-    # Restart containers even in case of error if they were running
-    if [ ! -z "$RUNNING_CONTAINERS" ]; then
-      log "INFO" "Restarting containers after error..."
-      echo "Restarting containers after error..."
-      for CONTAINER in $RUNNING_CONTAINERS; do
-        if docker start $CONTAINER; then
-          log "INFO" "Container $CONTAINER restarted"
-          echo "Container $CONTAINER restarted"
-        else
-          log "ERROR" "Unable to restart container $CONTAINER"
-          echo "Error: unable to restart container $CONTAINER"
-          log "WARNING" "Manual intervention required to restart container: $CONTAINER"
-        fi
-      done
-    fi
-    
+    # Don't remove temp volume on failure for debugging
+    log "WARNING" "Temporary volume $temp_volume retained for debugging purposes. Remove manually when done."
+    echo "Temporary volume $temp_volume retained for debugging purposes. Remove manually when done."
     exit 1
-  fi
-  
-  # Restart containers if they were running
-  if [ ! -z "$RUNNING_CONTAINERS" ]; then
-    log "INFO" "Restarting containers..."
-    echo "Restarting containers..."
-    for CONTAINER in $RUNNING_CONTAINERS; do
-      if docker start $CONTAINER; then
-        log "INFO" "Container $CONTAINER restarted"
-        echo "Container $CONTAINER restarted"
-      else
-        log "ERROR" "Unable to restart container $CONTAINER"
-        echo "Error: unable to restart container $CONTAINER"
-        log "WARNING" "Manual intervention required to restart container: $CONTAINER"
-      fi
-    done
   fi
   
   log "INFO" "Restoration completed successfully!"
@@ -386,7 +514,7 @@ echo "====== Docker Volume Restore Tool ======"
 log "INFO" "Starting Docker volume restoration tool"
 echo ""
 
-# If a specific date was provided via command line
+# Get available backup dates
 if [ ! -z "$SPECIFIC_DATE" ]; then
   log "INFO" "Using specified backup date: $SPECIFIC_DATE"
   
@@ -400,40 +528,48 @@ if [ ! -z "$SPECIFIC_DATE" ]; then
   fi
   
   # Set directly without showing the menu
-  BACKUP_DATE="$SPECIFIC_DATE"
+  BACKUP_DATE_DIR="$BACKUP_DIR/$SPECIFIC_DATE"
 else
   # Show the list of available backup dates
-  show_available_dates
-  MAX_DATES=$?
-
+  read -ra BACKUP_DIRS <<< $(show_available_dates)
+  
+  if [ ${#BACKUP_DIRS[@]} -eq 0 ]; then
+    log "ERROR" "No backup directories found"
+    exit 1
+  fi
+  
   # Ask user to choose a date
-  read -p "Select a backup date (1-$((MAX_DATES-1)), 0 to exit): " DATE_CHOICE
-
+  read -p "Select a backup date (1-${#BACKUP_DIRS[@]}, 0 to exit): " DATE_CHOICE
+  
   if [ "$DATE_CHOICE" -eq 0 ]; then
     log "INFO" "Operation canceled by user"
     echo "Operation canceled."
     exit 0
   fi
-
-  if [ "$DATE_CHOICE" -lt 1 ] || [ "$DATE_CHOICE" -ge "$MAX_DATES" ]; then
+  
+  if [ "$DATE_CHOICE" -lt 1 ] || [ "$DATE_CHOICE" -gt "${#BACKUP_DIRS[@]}" ]; then
     log "ERROR" "Invalid choice: $DATE_CHOICE"
     echo "Invalid choice."
     exit 1
   fi
-
-  # Get the selected backup date
-  BACKUP_DATE=$(find $BACKUP_DIR -mindepth 1 -maxdepth 1 -type d | sort -r | sed -n "${DATE_CHOICE}p" | xargs basename)
-  log "INFO" "Selected date: $BACKUP_DATE"
+  
+  # Get the selected backup date directory
+  BACKUP_DATE_DIR="${BACKUP_DIRS[$((DATE_CHOICE-1))]}"
+  log "INFO" "Selected date: $(basename "$BACKUP_DATE_DIR")"
 fi
 
 # Check if a volume was specified as an argument
 if [ -z "$VOLUME_ARG" ]; then
   # No volume specified, show the list for the selected date
-  show_available_volumes "$BACKUP_DATE"
-  MAX_VOLUMES=$?
+  read -ra AVAILABLE_VOLUMES <<< $(show_available_volumes "$BACKUP_DATE_DIR")
+  
+  if [ ${#AVAILABLE_VOLUMES[@]} -eq 0 ]; then
+    log "ERROR" "No volumes found in selected backup"
+    exit 1
+  fi
   
   # Ask user to choose
-  read -p "Select the volume to restore (1-$((MAX_VOLUMES-1)), 0 to exit): " VOLUME_CHOICE
+  read -p "Select the volume to restore (1-${#AVAILABLE_VOLUMES[@]}, 0 to exit): " VOLUME_CHOICE
   
   if [ "$VOLUME_CHOICE" -eq 0 ]; then
     log "INFO" "Operation canceled by user"
@@ -441,38 +577,48 @@ if [ -z "$VOLUME_ARG" ]; then
     exit 0
   fi
   
-  if [ "$VOLUME_CHOICE" -lt 1 ] || [ "$VOLUME_CHOICE" -ge "$MAX_VOLUMES" ]; then
+  if [ "$VOLUME_CHOICE" -lt 1 ] || [ "$VOLUME_CHOICE" -gt "${#AVAILABLE_VOLUMES[@]}" ]; then
     log "ERROR" "Invalid choice: $VOLUME_CHOICE"
     echo "Invalid choice."
     exit 1
   fi
   
   # Get the name of the selected volume
-  VOLUME=$(find "$BACKUP_DIR/$BACKUP_DATE" -name "*.tar.gz" -type f | xargs -n1 basename | sed 's/.tar.gz$//' | sed -n "${VOLUME_CHOICE}p")
+  VOLUME="${AVAILABLE_VOLUMES[$((VOLUME_CHOICE-1))]}"
 else
   # Volume specified as an argument
   VOLUME=$VOLUME_ARG
   
   # Verify the specified volume has a backup
-  if [ ! -f "$BACKUP_DIR/$BACKUP_DATE/$VOLUME.tar.gz" ]; then
-    log "ERROR" "No backup found for volume $VOLUME on date $BACKUP_DATE"
-    echo "Error: No backup found for volume $VOLUME on date $BACKUP_DATE"
+  if [ ! -f "$BACKUP_DATE_DIR/$VOLUME.tar.gz" ]; then
+    log "ERROR" "No backup found for volume $VOLUME in $(basename "$BACKUP_DATE_DIR")"
+    echo "Error: No backup found for volume $VOLUME in $(basename "$BACKUP_DATE_DIR")"
     
     # Show available volumes for this date to help the user
-    echo "Available volumes for $BACKUP_DATE:"
-    find "$BACKUP_DIR/$BACKUP_DATE" -name "*.tar.gz" -type f | xargs -n1 basename | sed 's/.tar.gz$//' | sort
+    echo "Available volumes for $(basename "$BACKUP_DATE_DIR"):"
+    find "$BACKUP_DATE_DIR" -name "*.tar.gz" -type f | xargs -n1 basename | sed 's/.tar.gz$//' | sort
     exit 1
   fi
 fi
 
 log "INFO" "Selected volume: $VOLUME"
 
-# For consistency with the rest of the script, even if there's only one backup, we show the function
-show_available_backups "$BACKUP_DATE" "$VOLUME"
-
 # The backup file is always in the standard location for the selected date and volume
-BACKUP_FILE="$BACKUP_DIR/$BACKUP_DATE/$VOLUME.tar.gz"
+BACKUP_FILE="$BACKUP_DATE_DIR/$VOLUME.tar.gz"
 log "INFO" "Selected backup: $BACKUP_FILE"
 
+# Ask for final confirmation
+if [ "$FORCE" != "true" ]; then
+  echo "Ready to restore volume '$VOLUME' from backup: $(basename "$BACKUP_DATE_DIR")"
+  read -p "This will override existing data in the volume. Continue? (y/n): " FINAL_CONFIRM
+  if [ "$FINAL_CONFIRM" != "y" ]; then
+    log "INFO" "Restoration canceled by user at final confirmation"
+    echo "Restoration canceled."
+    exit 0
+  fi
+fi
+
 # Perform the restoration
-restore_volume $VOLUME $BACKUP_FILE
+restore_volume "$VOLUME" "$BACKUP_FILE"
+
+exit 0

@@ -11,6 +11,9 @@ A set of bash utilities for backing up and restoring Docker volumes reliably and
 - **Retention Policy**: Automatically removes backups older than a specified number of days
 - **Full CLI Support**: Comprehensive command-line options and environment variable integration
 - **Interactive Restoration**: User-friendly interactive mode for selecting backups to restore
+- **Disk Space Verification**: Automatically checks if there's enough free space for backups/restores
+- **Two-Stage Restoration**: Performs a test restoration to a temporary volume for safety
+- **Cleanup on Exit**: Ensures containers are restarted even if the scripts exit unexpectedly
 
 ## Installation
 
@@ -99,34 +102,43 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 
 - Docker installed and running
 - User with access to Docker (in the docker group or running as root)
-- Sufficient disk space for backups
+- Sufficient disk space for backups (at least 500MB free plus estimated backup size)
 - Basic bash utilities (find, sed, etc.)
+- The script will automatically verify these prerequisites before running
 
 ## How It Works
 
 ### Backup Process
 
-1. Identifies volumes to back up (all or specified with the `-v` option)
-2. For each volume:
+1. Verifies prerequisites (Docker access, permissions, disk space)
+2. Identifies volumes to back up (all or specified with the `-v` option)
+3. Estimates disk space requirements and verifies sufficient free space
+4. Maps containers to volumes for efficient stopping/starting
+5. For each volume:
    - Identifies containers using the volume
    - Skips the volume if the `-s/--skip-used` option is enabled and the volume is in use
    - Asks for confirmation before stopping containers (unless `-f/--force` is used)
    - Stops containers if necessary
    - Creates compressed archive of volume data with specified compression level
-   - Verifies backup integrity
-   - Restarts any stopped containers
-3. Provides a summary of successful and failed backups
-4. Cleans up old backups according to retention policy
+   - Verifies backup integrity and content
+   - Records backup statistics (size, duration, etc.)
+6. Restarts any stopped containers (even if errors occurred)
+7. Provides a summary of successful and failed backups
+8. Cleans up old backups according to retention policy
 
 ### Restore Process
 
-1. Shows list of available backup dates (or uses specified date with `-b` option)
-2. Shows list of volumes available in the selected backup
-3. Verifies backup integrity before restoration
-4. Identifies and stops only running containers that use the volume
-5. Performs data restoration with detailed progress indication
-6. Restarts containers that were previously running
-7. Verifies restored data and reports any issues
+1. Verifies prerequisites (Docker access, permissions, disk space)
+2. Shows list of available backup dates (or uses specified date with `-b` option)
+3. Shows list of volumes available in the selected backup
+4. Verifies backup integrity and content before restoration
+5. Creates a temporary volume to test the backup restoration first
+6. Identifies and stops only running containers that use the volume
+7. Clears the target volume to ensure clean state
+8. Performs data restoration with detailed progress indication
+9. Verifies restored data with file count checks
+10. Restarts containers that were previously running
+11. Removes the temporary test volume if successful
 
 ## Best Practices
 
@@ -136,12 +148,27 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 - Set an appropriate retention policy to manage disk space
 - Use the `-s/--skip-used` flag for backup during high traffic times
 - Consider using higher compression levels for long-term archival
+- Ensure sufficient free disk space (at least twice the size of your volumes)
+- Monitor backup logs for warnings or errors
+- Test restoration occasionally to verify backup integrity
+
+## Security Considerations
+
+- The scripts need to be run by a user with Docker permissions
+- Backup files contain all volume data and should be stored securely
+- Consider encrypting backups for sensitive data
+- The scripts automatically restart containers after backups/restores, which might trigger automated processes
 
 ## Troubleshooting
 
 **Error: Current user cannot execute Docker commands**
 - Ensure your user is in the docker group: `sudo usermod -aG docker $USER`
 - Log out and back in for the group change to take effect
+
+**Error: Insufficient disk space for backup/restore**
+- Free up disk space on your backup destination
+- Use a different backup location with more free space
+- For backups, consider using higher compression levels
 
 **Error: Unable to create directory**
 - Check permissions on the parent directory
@@ -156,6 +183,10 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 - The container might need manual intervention
 - Try restarting it with `docker start <container_name>`
 - Check logs with `docker logs <container_name>`
+
+**Error: Temporary volume creation failed**
+- Check Docker volume driver status
+- Ensure Docker has sufficient resources
 
 ## Contributing
 
