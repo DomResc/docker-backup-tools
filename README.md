@@ -16,7 +16,7 @@ A set of bash utilities for backing up and restoring Docker volumes reliably and
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/docker-volume-tools.git
+git clone https://github.com/domresc/docker-volume-tools.git
 cd docker-volume-tools
 
 # Make scripts executable
