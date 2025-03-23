@@ -191,13 +191,46 @@ if [ -z "$VOLUMES" ]; then
   log "WARNING" "No Docker volumes found in the system"
 fi
 
+# Filter volumes if a specific list was provided
+VOLUMES_TO_BACKUP=()
+if [ ! -z "$SELECTED_VOLUMES" ]; then
+  log "INFO" "Filtering volumes: $SELECTED_VOLUMES"
+  # Convert comma-separated list to array
+  IFS=',' read -ra VOLUME_LIST <<< "$SELECTED_VOLUMES"
+  
+  # Filter volumes
+  for VOLUME in $VOLUMES; do
+    if echo "${VOLUME_LIST[@]}" | grep -q "$VOLUME"; then
+      VOLUMES_TO_BACKUP+=("$VOLUME")
+    fi
+  done
+  
+  # Check if any requested volumes were not found
+  for REQUESTED in "${VOLUME_LIST[@]}"; do
+    if ! echo "$VOLUMES" | grep -q "$REQUESTED"; then
+      log "WARNING" "Requested volume not found: $REQUESTED"
+    fi
+  done
+  
+  # If no volumes match the filter, exit
+  if [ ${#VOLUMES_TO_BACKUP[@]} -eq 0 ]; then
+    log "ERROR" "None of the specified volumes were found"
+    exit 1
+  fi
+else
+  # No filter, use all volumes
+  for VOLUME in $VOLUMES; do
+    VOLUMES_TO_BACKUP+=("$VOLUME")
+  done
+fi
+
 # Counters for statistics
 TOTAL_VOLUMES=0
 SUCCESSFUL_BACKUPS=0
 FAILED_BACKUPS=0
 
 # For each volume, find containers using it, stop them, backup, and restart
-for VOLUME in $VOLUMES
+for VOLUME in "${VOLUMES_TO_BACKUP[@]}"
 do
   TOTAL_VOLUMES=$((TOTAL_VOLUMES+1))
   BACKUP_FILE="$BACKUP_DATE_DIR/$VOLUME.tar.gz"
@@ -209,7 +242,22 @@ do
   
   # If there are containers using this volume
   if [ ! -z "$CONTAINERS" ]; then
+    # Skip if the skip-used option is enabled
+    if [ "$SKIP_USED" = true ]; then
+      log "INFO" "Skipping volume $VOLUME used by running containers (--skip-used enabled)"
+      continue
+    fi
+    
     log "INFO" "Containers using volume $VOLUME: $CONTAINERS"
+    
+    # Ask for confirmation unless force mode is enabled
+    if [ "$FORCE" != "true" ]; then
+      read -p "Containers need to be stopped. Continue with backup? (y/n): " CONFIRM
+      if [ "$CONFIRM" != "y" ]; then
+        log "INFO" "Backup canceled by user for volume $VOLUME"
+        continue
+      fi
+    fi
     
     # Stop the containers
     log "INFO" "Stopping containers..."
@@ -219,6 +267,8 @@ do
         log "INFO" "Container $CONTAINER stopped"
       else
         log "ERROR" "Unable to stop container $CONTAINER"
+        # If we can't stop a container, we shouldn't continue with this volume
+        continue 2
       fi
     done
     
@@ -227,7 +277,7 @@ do
     if docker run --rm \
       -v $VOLUME:/source:ro \
       -v $BACKUP_DIR:/backup \
-      alpine sh -c "apk add --no-cache pigz && tar -cf - -C /source . | pigz -1 > /backup/$DATE/$VOLUME.tar.gz || tar -czf /backup/$DATE/$VOLUME.tar.gz -C /source ."; then
+      alpine sh -c "apk add --no-cache pigz && tar -cf - -C /source . | pigz -$COMPRESSION > /backup/$DATE/$VOLUME.tar.gz || tar -czf /backup/$DATE/$VOLUME.tar.gz -C /source ."; then
       log "INFO" "Backup of volume $VOLUME completed: $BACKUP_FILE"
     else
       log "ERROR" "Backup of volume $VOLUME failed"
@@ -237,8 +287,11 @@ do
       log "INFO" "Restarting containers after error..."
       for CONTAINER in $CONTAINERS
       do
-        docker start $CONTAINER
-        log "INFO" "Container $CONTAINER restarted"
+        if docker start $CONTAINER; then
+          log "INFO" "Container $CONTAINER restarted"
+        else
+          log "ERROR" "Unable to restart container $CONTAINER"
+        fi
       done
       
       continue
@@ -259,6 +312,7 @@ do
         log "INFO" "Container $CONTAINER restarted"
       else
         log "ERROR" "Unable to restart container $CONTAINER"
+        log "WARNING" "Manual intervention required to restart container: $CONTAINER"
       fi
     done
   else
@@ -268,7 +322,7 @@ do
     if docker run --rm \
       -v $VOLUME:/source:ro \
       -v $BACKUP_DIR:/backup \
-      alpine sh -c "apk add --no-cache pigz && tar -cf - -C /source . | pigz -1 > /backup/$DATE/$VOLUME.tar.gz || tar -czf /backup/$DATE/$VOLUME.tar.gz -C /source ."; then
+      alpine sh -c "apk add --no-cache pigz && tar -cf - -C /source . | pigz -$COMPRESSION > /backup/$DATE/$VOLUME.tar.gz || tar -czf /backup/$DATE/$VOLUME.tar.gz -C /source ."; then
       log "INFO" "Backup of volume $VOLUME completed: $BACKUP_FILE"
       
       # Verify integrity
@@ -290,7 +344,6 @@ do
   fi
 done
 
-# Final summary
 # Clean up old backups based on retention policy
 cleanup_old_backups() {
   if [ "$RETENTION_DAYS" -gt 0 ]; then

@@ -53,9 +53,15 @@ chmod +x docker_backup.sh docker_restore.sh
 # Backup specific volumes only
 ./docker_backup.sh -v postgres_data,mongodb_data
 
+# Skip volumes that are currently in use by containers
+./docker_backup.sh -s
+
 # Keep backups for 60 days and use environment variable for directory
 export DOCKER_BACKUP_DIR=/mnt/storage/backups
 ./docker_backup.sh -r 60
+
+# Backup with forced container stopping (no confirmation prompts)
+./docker_backup.sh -f
 ```
 
 ## Restore Usage
@@ -100,11 +106,13 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 
 ### Backup Process
 
-1. Identifies volumes to back up (all or specified)
+1. Identifies volumes to back up (all or specified with the `-v` option)
 2. For each volume:
    - Identifies containers using the volume
+   - Skips the volume if the `-s/--skip-used` option is enabled and the volume is in use
+   - Asks for confirmation before stopping containers (unless `-f/--force` is used)
    - Stops containers if necessary
-   - Creates compressed archive of volume data
+   - Creates compressed archive of volume data with specified compression level
    - Verifies backup integrity
    - Restarts any stopped containers
 3. Provides a summary of successful and failed backups
@@ -112,12 +120,13 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 
 ### Restore Process
 
-1. Shows list of available backup dates (or uses specified date)
+1. Shows list of available backup dates (or uses specified date with `-b` option)
 2. Shows list of volumes available in the selected backup
 3. Verifies backup integrity before restoration
-4. Handles stopping and restarting affected containers
+4. Identifies and stops only running containers that use the volume
 5. Performs data restoration with detailed progress indication
-6. Verifies restored data
+6. Restarts containers that were previously running
+7. Verifies restored data and reports any issues
 
 ## Best Practices
 
@@ -125,6 +134,8 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 - Store backups on a separate disk/server for safety
 - Regularly test the restore process on non-production volumes
 - Set an appropriate retention policy to manage disk space
+- Use the `-s/--skip-used` flag for backup during high traffic times
+- Consider using higher compression levels for long-term archival
 
 ## Troubleshooting
 
@@ -140,6 +151,11 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 - The backup file may be corrupted
 - Try an earlier backup if available
 - Check disk space and permissions
+
+**Error: Unable to restart container**
+- The container might need manual intervention
+- Try restarting it with `docker start <container_name>`
+- Check logs with `docker logs <container_name>`
 
 ## Contributing
 

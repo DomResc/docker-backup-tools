@@ -84,6 +84,27 @@ done
 
 LOG_FILE="$BACKUP_DIR/docker_backup.log"
 
+# Verify that the script is executed with necessary permissions
+verify_permissions() {
+  # Check if the user can execute docker commands
+  if ! docker ps > /dev/null 2>&1; then
+    echo "ERROR: Current user cannot execute Docker commands."
+    echo "Make sure you are in the 'docker' group or are root:"
+    echo "sudo usermod -aG docker $USER"
+    echo "After adding to the group, restart your session (logout/login)."
+    exit 1
+  fi
+  
+  # Check if backup directory exists
+  if [ ! -d "$BACKUP_DIR" ]; then
+    echo "ERROR: Backup directory $BACKUP_DIR does not exist."
+    echo "Please check the path or create it first."
+    exit 1
+  fi
+  
+  echo "Necessary permissions verified. Continuing script execution..."
+}
+
 # Logging function
 log() {
   local level="$1"
@@ -92,31 +113,34 @@ log() {
   echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
 }
 
-# Create directory if it doesn't exist
-mkdir -p $BACKUP_DIR
-
 # Create log file if it doesn't exist
 if [ ! -f "$LOG_FILE" ]; then
+  mkdir -p $(dirname "$LOG_FILE")
   touch "$LOG_FILE"
   log "INFO" "Log file created at $LOG_FILE"
 fi
 
+# Verify permissions
+verify_permissions
+
 # Function to verify backup integrity
 verify_backup() {
   local backup_file="$1"
+  local backup_rel_path=$(basename "$backup_file")
+  local backup_dir=$(dirname "$backup_file")
   
   log "INFO" "Verifying backup integrity: $backup_file"
   
   # Verify integrity of tar archive with pigz if available
-  if docker run --rm \
-    -v $BACKUP_DIR:/backup \
-    alpine sh -c "apk add --no-cache pigz && pigz -t /backup/$(basename $backup_file) || tar -tzf /backup/$(basename $backup_file)" > /dev/null 2>&1; then
-    log "INFO" "Integrity verification completed successfully"
-    return 0
-  else
+  if ! docker run --rm \
+    -v "$backup_dir:/backup_dir" \
+    alpine sh -c "apk add --no-cache pigz && pigz -t /backup_dir/$backup_rel_path || tar -tzf /backup_dir/$backup_rel_path" > /dev/null 2>&1; then
     log "ERROR" "Integrity verification failed. The backup might be corrupted."
     return 1
   fi
+  
+  log "INFO" "Integrity verification completed successfully"
+  return 0
 }
 
 # Function to show available backup dates
@@ -126,7 +150,7 @@ show_available_dates() {
   echo "-------------------------"
   
   # Find all backup directories sorted by date (most recent first)
-  BACKUP_DATES=$(find $BACKUP_DIR -mindepth 1 -maxdepth 1 -type d | sort -r)
+  BACKUP_DATES=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | sort -r)
   
   if [ -z "$BACKUP_DATES" ]; then
     log "WARNING" "No backup directories found in $BACKUP_DIR"
@@ -223,36 +247,54 @@ restore_volume() {
   
   # Find containers using this volume
   CONTAINERS=$(docker ps -a --filter volume=$VOLUME --format "{{.Names}}")
+  RUNNING_CONTAINERS=$(docker ps --filter volume=$VOLUME --format "{{.Names}}")
   
   # If there are containers using this volume, stop them
   if [ ! -z "$CONTAINERS" ]; then
     log "INFO" "Containers using volume $VOLUME: $CONTAINERS"
     echo "Containers using volume $VOLUME: $CONTAINERS"
     
-    # Ask for confirmation unless force mode is enabled
-    if [ "$FORCE" != "true" ]; then
-      read -p "These containers will be stopped during restoration. Continue? (y/n): " CONFIRM
-      if [ "$CONFIRM" != "y" ]; then
-        log "INFO" "Restoration canceled by user"
-        echo "Restoration canceled."
-        exit 0
-      fi
-    else
-      log "INFO" "Force mode enabled, skipping container stop confirmation"
-    fi
-    
-    # Stop containers
-    log "INFO" "Stopping containers..."
-    echo "Stopping containers..."
-    for CONTAINER in $CONTAINERS; do
-      if docker stop $CONTAINER; then
-        log "INFO" "Container $CONTAINER stopped"
-        echo "Container $CONTAINER stopped"
+    if [ ! -z "$RUNNING_CONTAINERS" ]; then
+      log "INFO" "Running containers using volume $VOLUME: $RUNNING_CONTAINERS"
+      echo "Running containers using volume $VOLUME: $RUNNING_CONTAINERS"
+      
+      # Ask for confirmation unless force mode is enabled
+      if [ "$FORCE" != "true" ]; then
+        read -p "These containers will be stopped during restoration. Continue? (y/n): " CONFIRM
+        if [ "$CONFIRM" != "y" ]; then
+          log "INFO" "Restoration canceled by user"
+          echo "Restoration canceled."
+          exit 0
+        fi
       else
-        log "ERROR" "Unable to stop container $CONTAINER"
-        echo "Error: unable to stop container $CONTAINER"
+        log "INFO" "Force mode enabled, skipping container stop confirmation"
       fi
-    done
+      
+      # Stop containers
+      log "INFO" "Stopping containers..."
+      echo "Stopping containers..."
+      for CONTAINER in $RUNNING_CONTAINERS; do
+        if docker stop $CONTAINER; then
+          log "INFO" "Container $CONTAINER stopped"
+          echo "Container $CONTAINER stopped"
+        else
+          log "ERROR" "Unable to stop container $CONTAINER"
+          echo "Error: unable to stop container $CONTAINER"
+          
+          # If force is enabled, continue anyway
+          if [ "$FORCE" != "true" ]; then
+            read -p "Continue anyway? (y/n): " CONFIRM
+            if [ "$CONFIRM" != "y" ]; then
+              log "INFO" "Restoration canceled by user"
+              echo "Restoration canceled."
+              exit 0
+            fi
+          fi
+        fi
+      done
+    else
+      log "INFO" "No running containers are using volume $VOLUME"
+    fi
   fi
   
   # Create volume if it doesn't exist
@@ -272,13 +314,17 @@ restore_volume() {
   # Timestamp for start of restoration
   START_TIME=$(date +%s)
   
+  # Get the directory containing the backup file
+  BACKUP_DIR_PATH=$(dirname "$BACKUP_FILE")
+  BACKUP_FILENAME=$(basename "$BACKUP_FILE")
+  
   # Restore backup with pigz for faster speed
   log "INFO" "Restoring data in progress... (this may take time)"
   echo "Restoring data in progress... (this may take time)"
   if docker run --rm \
     -v $VOLUME:/target \
-    -v $BACKUP_DIR:/backup \
-    alpine sh -c "apk add --no-cache pigz && pigz -dc /backup/$(basename $BACKUP_FILE) | tar -xf - -C /target || tar -xzf /backup/$(basename $BACKUP_FILE) -C /target"; then
+    -v $BACKUP_DIR_PATH:/backup_src \
+    alpine sh -c "apk add --no-cache pigz && pigz -dc /backup_src/$BACKUP_FILENAME | tar -xf - -C /target || tar -xzf /backup_src/$BACKUP_FILENAME -C /target"; then
     
     # Calculate restoration time
     END_TIME=$(date +%s)
@@ -296,13 +342,18 @@ restore_volume() {
     echo "Error during data restoration"
     
     # Restart containers even in case of error if they were running
-    if [ ! -z "$CONTAINERS" ]; then
+    if [ ! -z "$RUNNING_CONTAINERS" ]; then
       log "INFO" "Restarting containers after error..."
       echo "Restarting containers after error..."
-      for CONTAINER in $CONTAINERS; do
-        docker start $CONTAINER
-        log "INFO" "Container $CONTAINER restarted"
-        echo "Container $CONTAINER restarted"
+      for CONTAINER in $RUNNING_CONTAINERS; do
+        if docker start $CONTAINER; then
+          log "INFO" "Container $CONTAINER restarted"
+          echo "Container $CONTAINER restarted"
+        else
+          log "ERROR" "Unable to restart container $CONTAINER"
+          echo "Error: unable to restart container $CONTAINER"
+          log "WARNING" "Manual intervention required to restart container: $CONTAINER"
+        fi
       done
     fi
     
@@ -310,16 +361,17 @@ restore_volume() {
   fi
   
   # Restart containers if they were running
-  if [ ! -z "$CONTAINERS" ]; then
+  if [ ! -z "$RUNNING_CONTAINERS" ]; then
     log "INFO" "Restarting containers..."
     echo "Restarting containers..."
-    for CONTAINER in $CONTAINERS; do
+    for CONTAINER in $RUNNING_CONTAINERS; do
       if docker start $CONTAINER; then
         log "INFO" "Container $CONTAINER restarted"
         echo "Container $CONTAINER restarted"
       else
         log "ERROR" "Unable to restart container $CONTAINER"
         echo "Error: unable to restart container $CONTAINER"
+        log "WARNING" "Manual intervention required to restart container: $CONTAINER"
       fi
     done
   fi
