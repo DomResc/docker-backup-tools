@@ -25,7 +25,7 @@
 # SOFTWARE.
 
 # Default configuration
-DEFAULT_LOG_DIR="/var/log/docker-tools"
+DEFAULT_LOG_DIR="/backup/docker"
 LOG_FILE="${DEFAULT_LOG_DIR}/docker_cleanup.log"
 
 # Parse command line arguments
