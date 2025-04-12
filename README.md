@@ -119,7 +119,7 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 | `-x, --prune-all`   | Run Docker system prune with all options (CAUTION: removes ALL unused objects) |
 | `-d, --dry-run`     | Show what would be removed without actually removing                           |
 | `-f, --force`       | Don't ask for confirmation                                                     |
-| `-l, --log-dir DIR` | Custom log directory (default: `/var/log/docker-tools`)                        |
+| `-l, --log-dir DIR` | Custom log directory (default: `/backup/docker`)                               |
 | `-h, --help`        | Display help message                                                           |
 
 ### Cleanup Examples
