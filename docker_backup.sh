@@ -578,7 +578,7 @@ fi
 
 # Parse the previously cached container-to-volume mapping
 log "INFO" "Processing container-to-volume relationships..."
-echo "$CONTAINER_VOLUME_MAPPING" | while IFS= read -r line; do
+while IFS= read -r line; do
   container_name=$(echo "$line" | cut -d'|' -f1)
   mounts=$(echo "$line" | cut -d'|' -f3-)
   
@@ -605,7 +605,7 @@ echo "$CONTAINER_VOLUME_MAPPING" | while IFS= read -r line; do
       fi
     fi
   done
-done
+done < <(echo "$CONTAINER_VOLUME_MAPPING")
 
 # Check if there are volumes that should be skipped due to --skip-used flag
 if [ "$SKIP_USED" = true ]; then

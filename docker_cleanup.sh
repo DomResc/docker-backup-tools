@@ -437,12 +437,18 @@ clean_networks() {
     local name=$(echo "$network_info" | cut -d':' -f2)
     
     log "INFO" "Removing unused network: $name"
-    if docker network rm "$id" > /dev/null 2>&1; then
+    local error_output
+    if error_output=$(docker network rm "$id" 2>&1); then
       log "INFO" "Network $name removed successfully"
       removed=$((removed+1))
     else
-      log "ERROR" "Failed to remove network $name"
+      log "ERROR" "Failed to remove network $name: $error_output"
+      echo "Failed to remove network $name: $error_output"
       failed=$((failed+1))
+      if echo "$error_output" | grep -q "has active endpoints"; then
+        log "WARNING" "Network $name has active endpoints or dependencies that prevent removal"
+        echo "WARNING: Network $name has active endpoints or dependencies that prevent removal"
+      fi
     fi
   done
   

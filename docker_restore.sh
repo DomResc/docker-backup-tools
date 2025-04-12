@@ -198,9 +198,16 @@ verify_backup() {
   fi
   
   # Verify integrity of tar archive with pigz if available
-  if ! docker run --rm \
+  log "INFO" "Verifying backup integrity using pigz or tar"
+  if docker run --rm \
     -v "$backup_dir:/backup_dir" \
-    alpine sh -c "apk add --no-cache pigz && pigz -t /backup_dir/$backup_rel_path || tar -tzf /backup_dir/$backup_rel_path" > /dev/null 2>&1; then
+    alpine sh -c "apk add --no-cache pigz && pigz -t /backup_dir/$backup_rel_path" > /dev/null 2>&1; then
+    log "INFO" "Integrity verification passed using pigz"
+  elif docker run --rm \
+    -v "$backup_dir:/backup_dir" \
+    alpine sh -c "tar -tzf /backup_dir/$backup_rel_path" > /dev/null 2>&1; then
+    log "INFO" "Integrity verification passed using tar"
+  else
     log "ERROR" "Integrity verification failed. The backup might be corrupted."
     return 1
   fi
