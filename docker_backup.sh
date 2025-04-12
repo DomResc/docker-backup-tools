@@ -550,7 +550,7 @@ for volume in "${REGULAR_VOLUMES[@]}"; do
       fi
     fi
   done
-fi
+done
 
 # Now process last priority volumes
 for volume in "${LAST_VOLUMES[@]}"; do
@@ -624,7 +624,7 @@ for volume in "${LAST_VOLUMES[@]}"; do
       fi
     fi
   done
-fi
+done
 
 # Clean up old backups based on retention policy
 cleanup_old_backups() {
