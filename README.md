@@ -1,6 +1,6 @@
 # Docker Volume Tools
 
-A set of bash utilities for backing up and restoring Docker volumes reliably and efficiently.
+A set of bash utilities for backing up, restoring, and cleaning Docker volumes reliably and efficiently.
 
 ## Features
 
@@ -14,6 +14,7 @@ A set of bash utilities for backing up and restoring Docker volumes reliably and
 - **Disk Space Verification**: Automatically checks if there's enough free space for backups/restores
 - **Two-Stage Restoration**: Performs a test restoration to a temporary volume for safety
 - **Cleanup on Exit**: Ensures containers are restarted even if the scripts exit unexpectedly
+- **Resource Cleanup**: Comprehensive tool for cleaning unused Docker resources
 
 ## Installation
 
@@ -23,7 +24,7 @@ git clone https://github.com/domresc/docker-volume-tools.git
 cd docker-volume-tools
 
 # Make scripts executable
-chmod +x docker_backup.sh docker_restore.sh
+chmod +x docker_backup.sh docker_restore.sh docker_cleanup.sh
 ```
 
 ## Backup Usage
@@ -34,15 +35,15 @@ chmod +x docker_backup.sh docker_restore.sh
 
 ### Backup Options
 
-| Option | Environment Variable | Description |
-|--------|----------------------|-------------|
-| `-d, --directory DIR` | `DOCKER_BACKUP_DIR` | Backup directory (default: `/backup/docker`) |
-| `-c, --compression LVL` | `DOCKER_COMPRESSION` | Compression level 1-9 (default: 1) |
-| `-r, --retention DAYS` | `DOCKER_RETENTION_DAYS` | Days to keep backups (default: 30, 0 to disable) |
-| `-v, --volumes VOL1,...` | - | Only backup specific volumes (comma-separated) |
-| `-s, --skip-used` | - | Skip volumes used by running containers |
-| `-f, --force` | - | Don't ask for confirmation before stopping containers |
-| `-h, --help` | - | Display help message |
+| Option                   | Environment Variable    | Description                                           |
+| ------------------------ | ----------------------- | ----------------------------------------------------- |
+| `-d, --directory DIR`    | `DOCKER_BACKUP_DIR`     | Backup directory (default: `/backup/docker`)          |
+| `-c, --compression LVL`  | `DOCKER_COMPRESSION`    | Compression level 1-9 (default: 1)                    |
+| `-r, --retention DAYS`   | `DOCKER_RETENTION_DAYS` | Days to keep backups (default: 30, 0 to disable)      |
+| `-v, --volumes VOL1,...` | -                       | Only backup specific volumes (comma-separated)        |
+| `-s, --skip-used`        | -                       | Skip volumes used by running containers               |
+| `-f, --force`            | -                       | Don't ask for confirmation before stopping containers |
+| `-h, --help`             | -                       | Display help message                                  |
 
 ### Backup Examples
 
@@ -75,12 +76,12 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 
 ### Restore Options
 
-| Option | Environment Variable | Description |
-|--------|----------------------|-------------|
-| `-d, --directory DIR` | `DOCKER_BACKUP_DIR` | Backup directory (default: `/backup/docker`) |
-| `-b, --backup DATE` | - | Specific backup date to restore (format: YYYY-MM-DD) |
-| `-f, --force` | - | Don't ask for confirmation before stopping containers |
-| `-h, --help` | - | Display help message |
+| Option                | Environment Variable | Description                                           |
+| --------------------- | -------------------- | ----------------------------------------------------- |
+| `-d, --directory DIR` | `DOCKER_BACKUP_DIR`  | Backup directory (default: `/backup/docker`)          |
+| `-b, --backup DATE`   | -                    | Specific backup date to restore (format: YYYY-MM-DD)  |
+| `-f, --force`         | -                    | Don't ask for confirmation before stopping containers |
+| `-h, --help`          | -                    | Display help message                                  |
 
 ### Restore Examples
 
@@ -96,6 +97,51 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 
 # Force restore without confirmation prompts
 ./docker_restore.sh -f -b 2025-02-15 postgres_data
+```
+
+## Cleanup Usage
+
+```bash
+./docker_cleanup.sh [OPTIONS]
+```
+
+### Cleanup Options
+
+| Option              | Description                                                                    |
+| ------------------- | ------------------------------------------------------------------------------ |
+| `-v, --volumes`     | Clean unused volumes                                                           |
+| `-i, --images`      | Clean dangling images                                                          |
+| `-c, --containers`  | Remove stopped containers                                                      |
+| `-n, --networks`    | Remove unused networks                                                         |
+| `-b, --builder`     | Clean up builder cache                                                         |
+| `-t, --temp`        | Clean temporary restore volumes                                                |
+| `-a, --all`         | Clean all of the above                                                         |
+| `-x, --prune-all`   | Run Docker system prune with all options (CAUTION: removes ALL unused objects) |
+| `-d, --dry-run`     | Show what would be removed without actually removing                           |
+| `-f, --force`       | Don't ask for confirmation                                                     |
+| `-l, --log-dir DIR` | Custom log directory (default: `/var/log/docker-tools`)                        |
+| `-h, --help`        | Display help message                                                           |
+
+### Cleanup Examples
+
+```bash
+# Clean only unused volumes
+./docker_cleanup.sh -v
+
+# Clean dangling images and stopped containers
+./docker_cleanup.sh -i -c
+
+# Clean everything except with dry-run (no actual deletions)
+./docker_cleanup.sh -a -d
+
+# Clean temporary volumes created during restore operations
+./docker_cleanup.sh -t
+
+# Force cleanup of all resources without confirmation
+./docker_cleanup.sh -a -f
+
+# Run a complete system prune (caution: removes ALL unused objects)
+./docker_cleanup.sh -x
 ```
 
 ## Prerequisites
@@ -140,6 +186,20 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 10. Restarts containers that were previously running
 11. Removes the temporary test volume if successful
 
+### Cleanup Process
+
+1. Verifies Docker access permissions
+2. Based on specified options, performs targeted cleanup:
+   - For unused volumes: Identifies and removes volumes not attached to any containers
+   - For temporary volumes: Removes restore-temporary volumes (starting with "temp*restore*")
+   - For dangling images: Removes images without tags that are not being used
+   - For stopped containers: Removes containers in "exited" state
+   - For unused networks: Removes custom networks not used by any containers
+   - For builder cache: Cleans up Docker's build cache
+3. Provides detailed outputs and logs of all operations
+4. Can perform a "dry run" to show what would be removed without making changes
+5. Can run a complete system prune for thorough cleanup
+
 ## Best Practices
 
 - Set up regular cron jobs for automated backups
@@ -151,6 +211,8 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 - Ensure sufficient free disk space (at least twice the size of your volumes)
 - Monitor backup logs for warnings or errors
 - Test restoration occasionally to verify backup integrity
+- Run cleanup regularly with dry-run first to understand what will be removed
+- Use specific cleanup options instead of `--prune-all` in production environments
 
 ## Security Considerations
 
@@ -162,29 +224,36 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 ## Troubleshooting
 
 **Error: Current user cannot execute Docker commands**
+
 - Ensure your user is in the docker group: `sudo usermod -aG docker $USER`
 - Log out and back in for the group change to take effect
 
 **Error: Insufficient disk space for backup/restore**
+
 - Free up disk space on your backup destination
 - Use a different backup location with more free space
 - For backups, consider using higher compression levels
+- Run the cleanup script to free up Docker resources: `./docker_cleanup.sh -a`
 
 **Error: Unable to create directory**
+
 - Check permissions on the parent directory
 - Run manually with `sudo mkdir -p /backup/docker && sudo chown $USER:$USER /backup/docker`
 
 **Error: Integrity verification failed**
+
 - The backup file may be corrupted
 - Try an earlier backup if available
 - Check disk space and permissions
 
 **Error: Unable to restart container**
+
 - The container might need manual intervention
 - Try restarting it with `docker start <container_name>`
 - Check logs with `docker logs <container_name>`
 
 **Error: Temporary volume creation failed**
+
 - Check Docker volume driver status
 - Ensure Docker has sufficient resources
 
