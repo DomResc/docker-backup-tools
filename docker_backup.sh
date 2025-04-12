@@ -43,12 +43,14 @@ usage() {
   echo "  -v, --volumes VOL1,... Only backup specific volumes (comma-separated list)"
   echo "  -s, --skip-used        Skip volumes used by running containers"
   echo "  -f, --force            Don't ask for confirmation before stopping containers"
+  echo "  -p, --prioritize-last NAME1,...  Container names to backup last (comma-separated list)"
   echo "  -h, --help             Display this help message"
   echo ""
   echo "Environment variables:"
   echo "  DOCKER_BACKUP_DIR      Same as --directory"
   echo "  DOCKER_COMPRESSION     Same as --compression"
   echo "  DOCKER_RETENTION_DAYS  Same as --retention"
+  echo "  DOCKER_LAST_PRIORITY   Same as --prioritize-last"
   exit 1
 }
 
@@ -57,6 +59,7 @@ BACKUP_DIR=${DOCKER_BACKUP_DIR:-$DEFAULT_BACKUP_DIR}
 COMPRESSION=${DOCKER_COMPRESSION:-$DEFAULT_COMPRESSION_LEVEL}
 RETENTION_DAYS=${DOCKER_RETENTION_DAYS:-$DEFAULT_RETENTION_DAYS}
 SELECTED_VOLUMES=""
+LAST_PRIORITY=${DOCKER_LAST_PRIORITY:-""}
 SKIP_USED=false
 FORCE=false
 
@@ -87,6 +90,10 @@ while [[ $# -gt 0 ]]; do
       SELECTED_VOLUMES="$2"
       shift 2
       ;;
+    -p|--prioritize-last)
+      LAST_PRIORITY="$2"
+      shift 2
+      ;;
     -s|--skip-used)
       SKIP_USED=true
       shift
@@ -114,6 +121,8 @@ LOG_FILE="$BACKUP_DIR/docker_backup.log"
 declare -A CONTAINERS_BY_VOLUME
 # Map for storing stopped containers that need to be restarted
 declare -A STOPPED_CONTAINERS
+# Map for storing volumes that should be backed up last
+declare -A LAST_PRIORITY_VOLUMES
 
 # Logging function
 log() {
@@ -418,6 +427,20 @@ for volume in "${VOLUMES_TO_BACKUP[@]}"; do
         done
       fi
     fi
+    
+    # Check if this volume is used by a container in the last priority list
+    if [ ! -z "$LAST_PRIORITY" ]; then
+      IFS=',' read -ra LAST_PRIORITY_ARRAY <<< "$LAST_PRIORITY"
+      for container in $containers; do
+        for last_priority_container in "${LAST_PRIORITY_ARRAY[@]}"; do
+          if [ "$container" = "$last_priority_container" ]; then
+            log "INFO" "Marking volume $volume for last priority backup (used by $container)"
+            LAST_PRIORITY_VOLUMES["$volume"]=1
+            break 2  # Break out of both loops
+          fi
+        done
+      done
+    fi
   fi
 done
 
@@ -440,11 +463,26 @@ SUCCESSFUL_BACKUPS=0
 FAILED_BACKUPS=0
 SKIPPED_VOLUMES=0
 
-# For each volume, find containers using it, stop them, backup, and restart
+# Reorganize volumes: regular volumes first, last priority volumes at the end
+REGULAR_VOLUMES=()
+LAST_VOLUMES=()
+
 for volume in "${VOLUMES_TO_BACKUP[@]}"; do
+  if [ -n "${LAST_PRIORITY_VOLUMES[$volume]}" ]; then
+    LAST_VOLUMES+=("$volume")
+  else
+    REGULAR_VOLUMES+=("$volume")
+  fi
+done
+
+log "INFO" "Regular volumes to backup: ${#REGULAR_VOLUMES[@]}"
+log "INFO" "Last priority volumes to backup: ${#LAST_VOLUMES[@]}"
+
+# Process regular volumes first
+for volume in "${REGULAR_VOLUMES[@]}"; do
   BACKUP_FILE="$BACKUP_DATE_DIR/$volume.tar.gz"
   
-  log "INFO" "Processing volume: $volume"
+  log "INFO" "Processing regular priority volume: $volume"
   
   # If there are containers using this volume
   if [ ! -z "${CONTAINERS_BY_VOLUME[$volume]}" ]; then
@@ -500,7 +538,93 @@ for volume in "${VOLUMES_TO_BACKUP[@]}"; do
     BACKUP_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
     log "INFO" "Backup size for $volume: $BACKUP_SIZE"
   fi
-done
+  
+  # Restart containers for this volume before moving to next
+  for container in "${!STOPPED_CONTAINERS[@]}"; do
+    if [ "${STOPPED_CONTAINERS[$container]}" = "$volume" ]; then
+      if docker start "$container"; then
+        log "INFO" "Container $container restarted after backing up $volume"
+        unset STOPPED_CONTAINERS["$container"]
+      else
+        log "ERROR" "Unable to restart container $container after backing up $volume"
+      fi
+    fi
+  done
+}
+
+# Now process last priority volumes
+for volume in "${LAST_VOLUMES[@]}"; do
+  BACKUP_FILE="$BACKUP_DATE_DIR/$volume.tar.gz"
+  
+  log "INFO" "Processing last priority volume: $volume"
+  
+  # If there are containers using this volume
+  if [ ! -z "${CONTAINERS_BY_VOLUME[$volume]}" ]; then
+    log "INFO" "Containers using volume $volume: ${CONTAINERS_BY_VOLUME[$volume]}"
+    
+    # Stop containers
+    if ! stop_containers "$volume"; then
+      log "WARNING" "Skipping backup of volume $volume due to container stop issues"
+      SKIPPED_VOLUMES=$((SKIPPED_VOLUMES+1))
+      continue
+    fi
+  else
+    log "INFO" "No containers are using volume $volume"
+  fi
+  
+  # Perform backup using pigz (parallel gzip) for speed or fallback to regular tar
+  log "INFO" "Backing up volume: $volume"
+  
+  backup_start_time=$(date +%s)
+  
+  # Check if volume exists
+  if ! docker volume inspect "$volume" >/dev/null 2>&1; then
+    log "ERROR" "Volume $volume no longer exists"
+    FAILED_BACKUPS=$((FAILED_BACKUPS+1))
+    continue
+  fi
+  
+  # Run the backup command
+  if docker run --rm \
+    -v "$volume:/source:ro" \
+    -v "$BACKUP_DIR:/backup" \
+    alpine sh -c "apk add --no-cache pigz && tar -cf - -C /source . | pigz -$COMPRESSION > /backup/$DATE/$volume.tar.gz || tar -czf /backup/$DATE/$volume.tar.gz -C /source ."; then
+    
+    backup_end_time=$(date +%s)
+    backup_duration=$((backup_end_time - backup_start_time))
+    
+    log "INFO" "Backup of volume $volume completed in $backup_duration seconds: $BACKUP_FILE"
+    
+    # Verify integrity
+    if verify_backup "$BACKUP_FILE" "$volume"; then
+      SUCCESSFUL_BACKUPS=$((SUCCESSFUL_BACKUPS+1))
+    else
+      log "ERROR" "Backup verification failed for $volume"
+      FAILED_BACKUPS=$((FAILED_BACKUPS+1))
+    fi
+  else
+    log "ERROR" "Backup of volume $volume failed"
+    FAILED_BACKUPS=$((FAILED_BACKUPS+1))
+  fi
+  
+  # Calculate and display backup size
+  if [ -f "$BACKUP_FILE" ]; then
+    BACKUP_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
+    log "INFO" "Backup size for $volume: $BACKUP_SIZE"
+  fi
+  
+  # Restart containers for this volume immediately
+  for container in "${!STOPPED_CONTAINERS[@]}"; do
+    if [ "${STOPPED_CONTAINERS[$container]}" = "$volume" ]; then
+      if docker start "$container"; then
+        log "INFO" "Container $container restarted after backing up $volume"
+        unset STOPPED_CONTAINERS["$container"]
+      else
+        log "ERROR" "Unable to restart container $container after backing up $volume"
+      fi
+    fi
+  done
+}
 
 # Clean up old backups based on retention policy
 cleanup_old_backups() {

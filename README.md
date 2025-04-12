@@ -6,6 +6,7 @@ A set of bash utilities for backing up, restoring, and cleaning Docker volumes r
 
 - **Easy Backup**: Automatically backup all Docker volumes or specify just the ones you need
 - **Intelligent Container Handling**: Automatically stops and restarts containers when necessary
+- **Priority Backup Ordering**: Specify containers to backup last (useful for critical infrastructure services like DNS)
 - **Efficient Compression**: Uses parallel compression (pigz) for better performance
 - **Backup Integrity Verification**: Verifies backup integrity to ensure successful restoration
 - **Retention Policy**: Automatically removes backups older than a specified number of days
@@ -35,15 +36,16 @@ chmod +x docker_backup.sh docker_restore.sh docker_cleanup.sh
 
 ### Backup Options
 
-| Option                   | Environment Variable    | Description                                           |
-| ------------------------ | ----------------------- | ----------------------------------------------------- |
-| `-d, --directory DIR`    | `DOCKER_BACKUP_DIR`     | Backup directory (default: `/backup/docker`)          |
-| `-c, --compression LVL`  | `DOCKER_COMPRESSION`    | Compression level 1-9 (default: 1)                    |
-| `-r, --retention DAYS`   | `DOCKER_RETENTION_DAYS` | Days to keep backups (default: 30, 0 to disable)      |
-| `-v, --volumes VOL1,...` | -                       | Only backup specific volumes (comma-separated)        |
-| `-s, --skip-used`        | -                       | Skip volumes used by running containers               |
-| `-f, --force`            | -                       | Don't ask for confirmation before stopping containers |
-| `-h, --help`             | -                       | Display help message                                  |
+| Option                            | Environment Variable    | Description                                           |
+| --------------------------------- | ----------------------- | ----------------------------------------------------- |
+| `-d, --directory DIR`             | `DOCKER_BACKUP_DIR`     | Backup directory (default: `/backup/docker`)          |
+| `-c, --compression LVL`           | `DOCKER_COMPRESSION`    | Compression level 1-9 (default: 1)                    |
+| `-r, --retention DAYS`            | `DOCKER_RETENTION_DAYS` | Days to keep backups (default: 30, 0 to disable)      |
+| `-v, --volumes VOL1,...`          | -                       | Only backup specific volumes (comma-separated)        |
+| `-s, --skip-used`                 | -                       | Skip volumes used by running containers               |
+| `-f, --force`                     | -                       | Don't ask for confirmation before stopping containers |
+| `-p, --prioritize-last NAME1,...` | `DOCKER_LAST_PRIORITY`  | Container names to backup last (comma-separated)      |
+| `-h, --help`                      | -                       | Display help message                                  |
 
 ### Backup Examples
 
@@ -66,6 +68,16 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 
 # Backup with forced container stopping (no confirmation prompts)
 ./docker_backup.sh -f
+
+# Process critical infrastructure containers (like DNS servers) last
+./docker_backup.sh --prioritize-last pihole
+
+# Process multiple critical containers last
+./docker_backup.sh --prioritize-last "pihole,dns-server,network-gateway"
+
+# Set priority containers via environment variable
+export DOCKER_LAST_PRIORITY="pihole"
+./docker_backup.sh
 ```
 
 ## Restore Usage
@@ -160,7 +172,8 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 2. Identifies volumes to back up (all or specified with the `-v` option)
 3. Estimates disk space requirements and verifies sufficient free space
 4. Maps containers to volumes for efficient stopping/starting
-5. For each volume:
+5. Identifies containers that should be processed last (via `--prioritize-last` option)
+6. Processes regular volumes first:
    - Identifies containers using the volume
    - Skips the volume if the `-s/--skip-used` option is enabled and the volume is in use
    - Asks for confirmation before stopping containers (unless `-f/--force` is used)
@@ -168,9 +181,12 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
    - Creates compressed archive of volume data with specified compression level
    - Verifies backup integrity and content
    - Records backup statistics (size, duration, etc.)
-6. Restarts any stopped containers (even if errors occurred)
-7. Provides a summary of successful and failed backups
-8. Cleans up old backups according to retention policy
+   - Restarts containers for this volume immediately
+7. Then processes priority volumes (those used by critical containers):
+   - Follows the same backup procedure as regular volumes
+   - Ensures critical infrastructure containers are down for minimal time
+8. Provides a summary of successful and failed backups
+9. Cleans up old backups according to retention policy
 
 ### Restore Process
 
@@ -213,6 +229,7 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 - Test restoration occasionally to verify backup integrity
 - Run cleanup regularly with dry-run first to understand what will be removed
 - Use specific cleanup options instead of `--prune-all` in production environments
+- Use the `--prioritize-last` option for critical infrastructure containers like DNS servers to minimize service disruption
 
 ## Security Considerations
 
@@ -256,6 +273,11 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 
 - Check Docker volume driver status
 - Ensure Docker has sufficient resources
+
+**Problem: Critical containers like DNS servers affect all other containers when stopped**
+
+- Use the `--prioritize-last` option to ensure these containers are backed up last
+- This minimizes downtime for critical infrastructure services
 
 ## Contributing
 
