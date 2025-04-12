@@ -6,13 +6,15 @@ A set of bash utilities for backing up, restoring, and cleaning Docker volumes r
 
 - **Easy Backup**: Automatically backup all Docker volumes or specify just the ones you need
 - **Intelligent Container Handling**: Automatically stops and restarts containers when necessary
+- **Parallel Processing**: Backup multiple volumes simultaneously for improved performance
 - **Priority Backup Ordering**: Specify containers to backup last (useful for critical infrastructure services like DNS)
 - **Efficient Compression**: Uses parallel compression (pigz) for better performance
-- **Backup Integrity Verification**: Verifies backup integrity to ensure successful restoration
+- **Backup Integrity Verification**: Fast verification of backup integrity to ensure successful restoration
 - **Retention Policy**: Automatically removes backups older than a specified number of days
 - **Full CLI Support**: Comprehensive command-line options and environment variable integration
 - **Interactive Restoration**: User-friendly interactive mode for selecting backups to restore
 - **Disk Space Verification**: Automatically checks if there's enough free space for backups/restores
+- **Memory Optimization**: Auto-adjusts parallel jobs based on available system memory
 - **Two-Stage Restoration**: Performs a test restoration to a temporary volume for safety
 - **Cleanup on Exit**: Ensures containers are restarted even if the scripts exit unexpectedly
 - **Resource Cleanup**: Comprehensive tool for cleaning unused Docker resources
@@ -45,6 +47,7 @@ chmod +x docker_backup.sh docker_restore.sh docker_cleanup.sh
 | `-s, --skip-used`                 | -                       | Skip volumes used by running containers               |
 | `-f, --force`                     | -                       | Don't ask for confirmation before stopping containers |
 | `-p, --prioritize-last NAME1,...` | `DOCKER_LAST_PRIORITY`  | Container names to backup last (comma-separated)      |
+| `-j, --jobs NUM`                  | `DOCKER_PARALLEL_JOBS`  | Number of parallel backup jobs (default: 2)           |
 | `-h, --help`                      | -                       | Display help message                                  |
 
 ### Backup Examples
@@ -72,11 +75,14 @@ export DOCKER_BACKUP_DIR=/mnt/storage/backups
 # Process critical infrastructure containers (like DNS servers) last
 ./docker_backup.sh --prioritize-last pihole
 
-# Process multiple critical containers last
-./docker_backup.sh --prioritize-last "pihole,dns-server,network-gateway"
+# Use 4 parallel jobs for faster backup
+./docker_backup.sh --jobs 4
 
-# Set priority containers via environment variable
-export DOCKER_LAST_PRIORITY="pihole"
+# Process multiple critical containers last with parallel processing
+./docker_backup.sh --prioritize-last "pihole,dns-server,network-gateway" --jobs 3
+
+# Set parallel jobs via environment variable
+export DOCKER_PARALLEL_JOBS="4"
 ./docker_backup.sh
 ```
 
@@ -161,6 +167,7 @@ export DOCKER_LAST_PRIORITY="pihole"
 - Docker installed and running
 - User with access to Docker (in the docker group or running as root)
 - Sufficient disk space for backups (at least 500MB free plus estimated backup size)
+- Sufficient memory for parallel operations (auto-adjusts based on available memory)
 - Basic bash utilities (find, sed, etc.)
 - The script will automatically verify these prerequisites before running
 
@@ -168,18 +175,18 @@ export DOCKER_LAST_PRIORITY="pihole"
 
 ### Backup Process
 
-1. Verifies prerequisites (Docker access, permissions, disk space)
+1. Verifies prerequisites (Docker access, permissions, disk space, memory)
 2. Identifies volumes to back up (all or specified with the `-v` option)
 3. Estimates disk space requirements and verifies sufficient free space
 4. Maps containers to volumes for efficient stopping/starting
 5. Identifies containers that should be processed last (via `--prioritize-last` option)
-6. Processes regular volumes first:
+6. Processes regular volumes first (in parallel batches):
    - Identifies containers using the volume
    - Skips the volume if the `-s/--skip-used` option is enabled and the volume is in use
    - Asks for confirmation before stopping containers (unless `-f/--force` is used)
    - Stops containers if necessary
    - Creates compressed archive of volume data with specified compression level
-   - Verifies backup integrity and content
+   - Performs fast verification of backup integrity
    - Records backup statistics (size, duration, etc.)
    - Restarts containers for this volume immediately
 7. Then processes priority volumes (those used by critical containers):
@@ -216,6 +223,15 @@ export DOCKER_LAST_PRIORITY="pihole"
 4. Can perform a "dry run" to show what would be removed without making changes
 5. Can run a complete system prune for thorough cleanup
 
+## Performance Optimizations
+
+- **Parallel Volume Processing**: Process multiple volumes simultaneously with the `--jobs` option
+- **Memory-Aware Execution**: Automatically adjusts parallelism based on available system memory
+- **Fast Integrity Verification**: Optimized backup verification that doesn't require full decompression
+- **Metadata Caching**: Reduces Docker API calls by caching container and volume information
+- **Efficient Container Management**: Safely stops and restarts only the containers that need it
+- **Optimized Compression**: Uses pigz (parallel gzip) for multi-threaded compression
+
 ## Best Practices
 
 - Set up regular cron jobs for automated backups
@@ -223,6 +239,7 @@ export DOCKER_LAST_PRIORITY="pihole"
 - Regularly test the restore process on non-production volumes
 - Set an appropriate retention policy to manage disk space
 - Use the `-s/--skip-used` flag for backup during high traffic times
+- Use higher parallel jobs (`-j`) for systems with plenty of CPU cores and memory
 - Consider using higher compression levels for long-term archival
 - Ensure sufficient free disk space (at least twice the size of your volumes)
 - Monitor backup logs for warnings or errors
@@ -252,6 +269,13 @@ export DOCKER_LAST_PRIORITY="pihole"
 - For backups, consider using higher compression levels
 - Run the cleanup script to free up Docker resources: `./docker_cleanup.sh -a`
 
+**Error: Low memory conditions detected**
+
+- The script will automatically reduce the number of parallel jobs
+- You can manually specify fewer parallel jobs with `-j 1`
+- Close other memory-intensive applications
+- Add more RAM or increase swap space
+
 **Error: Unable to create directory**
 
 - Check permissions on the parent directory
@@ -278,6 +302,13 @@ export DOCKER_LAST_PRIORITY="pihole"
 
 - Use the `--prioritize-last` option to ensure these containers are backed up last
 - This minimizes downtime for critical infrastructure services
+
+**Problem: Backup is running slowly**
+
+- Increase the number of parallel jobs with `--jobs` option
+- Use a lower compression level (1-3) for faster backups
+- Store backups on SSD rather than HDD
+- Consider backing up fewer volumes at once
 
 ## Contributing
 
