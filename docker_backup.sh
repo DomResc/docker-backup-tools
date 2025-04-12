@@ -38,6 +38,8 @@ declare -A CONTAINERS_BY_VOLUME
 declare -A STOPPED_CONTAINERS
 declare -A LAST_PRIORITY_VOLUMES
 declare -A VOLUME_BACKUP_STATUS
+declare -A CONTAINERS_TO_RESTART
+declare -A VOLUMES_BY_CONTAINER
 
 # Parse command line arguments
 usage() {
@@ -300,7 +302,7 @@ stop_containers() {
     return 0
   fi
   
-  log "INFO" "Stopping containers using volume $volume: $containers"
+  log "INFO" "Containers using volume $volume: $containers"
   
   # Ask for confirmation unless force mode is enabled
   if [ "$FORCE" != "true" ]; then
@@ -325,6 +327,16 @@ stop_containers() {
         log "INFO" "Container $container stopped"
         # Add to temporary array
         stopped_containers_for_volume+=("$container")
+        
+        # Add to global tracking arrays - mark for restart later
+        CONTAINERS_TO_RESTART["$container"]=1
+        
+        # Append this volume to the container's volume list
+        if [ -z "${VOLUMES_BY_CONTAINER[$container]}" ]; then
+          VOLUMES_BY_CONTAINER["$container"]="$volume"
+        else
+          VOLUMES_BY_CONTAINER["$container"]="${VOLUMES_BY_CONTAINER[$container]} $volume"
+        fi
       else
         log "ERROR" "Unable to stop container $container"
         failed=true
@@ -338,7 +350,7 @@ stop_containers() {
     return 1
   fi
   
-  # Now safely add to the global tracking array
+  # Now safely add to the global tracking array for immediate restarts
   for container in "${stopped_containers_for_volume[@]}"; do
     STOPPED_CONTAINERS["$container"]="$volume"
   done
@@ -347,31 +359,52 @@ stop_containers() {
 }
 
 # Function to restart containers that were stopped during backup
+# This is now intentionally empty to prevent immediate restarts
 restart_containers() {
   local volume="$1"
-  local containers_to_restart=()
-  
-  # Find containers that need to be restarted for this volume
-  for container in "${!STOPPED_CONTAINERS[@]}"; do
-    if [[ "${STOPPED_CONTAINERS[$container]}" == "$volume" ]]; then
-      containers_to_restart+=("$container")
-    fi
-  done
-  
-  if [ ${#containers_to_restart[@]} -eq 0 ]; then
+  # This function is now intentionally empty to prevent immediate restarts
+  # We'll only restart containers after all volumes are backed up
+  log "INFO" "Delaying restart of containers for volume $volume until all volumes are processed"
+  return 0
+}
+
+# Function to restart all containers after all volumes are processed
+restart_all_containers_safely() {
+  if [ ${#CONTAINERS_TO_RESTART[@]} -eq 0 ]; then
+    log "INFO" "No containers to restart"
     return 0
   fi
   
-  log "INFO" "Restarting containers for volume $volume..."
+  log "INFO" "Restarting all containers after backup completion..."
   
-  for container in "${containers_to_restart[@]}"; do
-    if docker start "$container"; then
-      log "INFO" "Container $container restarted"
-      # Remove from the tracking array after successfully restarting
-      unset STOPPED_CONTAINERS["$container"]
+  for container in "${!CONTAINERS_TO_RESTART[@]}"; do
+    local volumes="${VOLUMES_BY_CONTAINER[$container]}"
+    
+    # Check if all volumes for this container are successfully backed up
+    local all_volumes_ready=true
+    for volume in $volumes; do
+      if [ "${VOLUME_BACKUP_STATUS[$volume]}" != "SUCCESS" ]; then
+        all_volumes_ready=false
+        break
+      fi
+    done
+    
+    if [ "$all_volumes_ready" = true ]; then
+      log "INFO" "All volumes for container $container are backed up. Restarting..."
+      if docker start "$container"; then
+        log "INFO" "Container $container restarted"
+        # Remove from tracking arrays
+        unset CONTAINERS_TO_RESTART["$container"]
+        unset VOLUMES_BY_CONTAINER["$container"]
+        
+        # Also remove from the immediate restart array if present
+        unset STOPPED_CONTAINERS["$container"]
+      else
+        log "ERROR" "Unable to restart container $container"
+        log "WARNING" "Manual intervention required to restart container: $container"
+      fi
     else
-      log "ERROR" "Unable to restart container $container"
-      log "WARNING" "Manual intervention required to restart container: $container"
+      log "WARNING" "Not restarting container $container because not all of its volumes were successfully backed up"
     fi
   done
 }
@@ -399,7 +432,24 @@ restart_all_containers() {
 # Function to ensure containers are restarted on script exit or error
 cleanup_on_exit() {
   log "INFO" "Running cleanup on exit..."
+  
+  # First try to restart using the new tracking system
+  if [ ${#CONTAINERS_TO_RESTART[@]} -gt 0 ]; then
+    log "INFO" "Restarting containers from new tracking system..."
+    for container in "${!CONTAINERS_TO_RESTART[@]}"; do
+      if docker inspect --format='{{.State.Running}}' "$container" 2>/dev/null | grep -q "false"; then
+        if docker start "$container"; then
+          log "INFO" "Container $container restarted during cleanup"
+        else
+          log "ERROR" "Unable to restart container $container during cleanup"
+        fi
+      fi
+    done
+  fi
+  
+  # Then try the old system as fallback
   restart_all_containers
+  
   log "INFO" "Cleanup completed"
 }
 
@@ -464,7 +514,6 @@ backup_volume() {
     log "INFO" "Backup size for $volume: $BACKUP_SIZE"
   fi
   
-  # Restart containers for this volume 
   restart_containers "$volume"
   
   return 0
@@ -669,6 +718,10 @@ if [ ${#LAST_VOLUMES[@]} -gt 0 ]; then
   log "INFO" "Processing last priority volumes..."
   process_volumes_parallel "${LAST_VOLUMES[@]}"
 fi
+
+# Now that all volumes are processed, restart containers safely
+log "INFO" "All backup operations completed. Now restarting containers..."
+restart_all_containers_safely
 
 # Clean up old backups based on retention policy
 cleanup_old_backups() {
