@@ -9,6 +9,7 @@ A set of bash utilities for backing up, restoring, and cleaning Docker volumes r
 - **Parallel Processing**: Backup multiple volumes simultaneously for improved performance
 - **Priority Backup Ordering**: Specify containers to backup last (useful for critical infrastructure services like DNS)
 - **Efficient Compression**: Uses parallel compression (pigz) for better performance
+- **Single Container Optimization**: Uses a single Alpine container for all operations, reducing overhead
 - **Backup Integrity Verification**: Fast verification of backup integrity to ensure successful restoration
 - **Retention Policy**: Automatically removes backups older than a specified number of days
 - **Full CLI Support**: Comprehensive command-line options and environment variable integration
@@ -18,6 +19,7 @@ A set of bash utilities for backing up, restoring, and cleaning Docker volumes r
 - **Two-Stage Restoration**: Performs a test restoration to a temporary volume for safety
 - **Cleanup on Exit**: Ensures containers are restarted even if the scripts exit unexpectedly
 - **Resource Cleanup**: Comprehensive tool for cleaning unused Docker resources
+- **System Information**: Shows Docker resource usage before cleanup operations
 
 ## Installation
 
@@ -180,7 +182,8 @@ export DOCKER_PARALLEL_JOBS="4"
 3. Estimates disk space requirements and verifies sufficient free space
 4. Maps containers to volumes for efficient stopping/starting
 5. Identifies containers that should be processed last (via `--prioritize-last` option)
-6. Processes regular volumes first (in parallel batches):
+6. Creates a single Alpine container with pigz installed for all compression operations
+7. Processes regular volumes first (in parallel batches):
    - Identifies containers using the volume
    - Skips the volume if the `-s/--skip-used` option is enabled and the volume is in use
    - Asks for confirmation before stopping containers (unless `-f/--force` is used)
@@ -188,49 +191,51 @@ export DOCKER_PARALLEL_JOBS="4"
    - Creates compressed archive of volume data with specified compression level
    - Performs fast verification of backup integrity
    - Records backup statistics (size, duration, etc.)
-   - Restarts containers for this volume immediately
-7. Then processes priority volumes (those used by critical containers):
-   - Follows the same backup procedure as regular volumes
-   - Ensures critical infrastructure containers are down for minimal time
-8. Provides a summary of successful and failed backups
-9. Cleans up old backups according to retention policy
+8. Then processes priority volumes (those used by critical containers)
+9. Restarts all affected containers after all volume backups are complete
+10. Provides a summary of successful and failed backups
+11. Cleans up old backups according to retention policy
 
 ### Restore Process
 
 1. Verifies prerequisites (Docker access, permissions, disk space)
 2. Shows list of available backup dates (or uses specified date with `-b` option)
 3. Shows list of volumes available in the selected backup
-4. Verifies backup integrity and content before restoration
-5. Creates a temporary volume to test the backup restoration first
-6. Identifies and stops only running containers that use the volume
-7. Clears the target volume to ensure clean state
-8. Performs data restoration with detailed progress indication
-9. Verifies restored data with file count checks
-10. Restarts containers that were previously running
-11. Removes the temporary test volume if successful
+4. Creates a single Alpine container with pigz installed for all decompression operations
+5. Verifies backup integrity and content before restoration
+6. Creates a temporary volume to test the backup restoration first
+7. Identifies and stops only running containers that use the volume
+8. Clears the target volume to ensure clean state
+9. Performs data restoration with detailed progress indication
+10. Verifies restored data with file count checks
+11. Restarts containers that were previously running
+12. Removes the temporary test volume if successful
 
 ### Cleanup Process
 
 1. Verifies Docker access permissions
-2. Based on specified options, performs targeted cleanup:
+2. Displays current Docker system usage statistics
+3. Based on specified options, performs targeted cleanup:
    - For unused volumes: Identifies and removes volumes not attached to any containers
    - For temporary volumes: Removes restore-temporary volumes (starting with "temp*restore*")
    - For dangling images: Removes images without tags that are not being used
    - For stopped containers: Removes containers in "exited" state
    - For unused networks: Removes custom networks not used by any containers
    - For builder cache: Cleans up Docker's build cache
-3. Provides detailed outputs and logs of all operations
-4. Can perform a "dry run" to show what would be removed without making changes
-5. Can run a complete system prune for thorough cleanup
+4. Provides detailed outputs and logs of all operations
+5. Can perform a "dry run" to show what would be removed without making changes
+6. Can run a complete system prune for thorough cleanup
 
 ## Performance Optimizations
 
+- **Single Container Reuse**: Uses a single Alpine container for all backup/restore operations
 - **Parallel Volume Processing**: Process multiple volumes simultaneously with the `--jobs` option
 - **Memory-Aware Execution**: Automatically adjusts parallelism based on available system memory
 - **Fast Integrity Verification**: Optimized backup verification that doesn't require full decompression
 - **Metadata Caching**: Reduces Docker API calls by caching container and volume information
 - **Efficient Container Management**: Safely stops and restarts only the containers that need it
 - **Optimized Compression**: Uses pigz (parallel gzip) for multi-threaded compression
+- **Delayed Container Restart**: Restarts containers only after all volumes are processed
 
 ## Best Practices
 

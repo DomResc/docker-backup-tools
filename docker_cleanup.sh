@@ -28,6 +28,9 @@
 DEFAULT_LOG_DIR="/backup/docker"
 LOG_FILE="${DEFAULT_LOG_DIR}/docker_cleanup.log"
 
+# Global container ID for the Alpine container used for cleanup operations
+ALPINE_CONTAINER_ID=""
+
 # Parse command line arguments
 usage() {
   echo "Usage: $0 [OPTIONS]"
@@ -137,6 +140,50 @@ log() {
   echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
 }
 
+# Function to create and prepare Alpine container (if needed for volume operations)
+create_alpine_container() {
+  log "INFO" "Creating Alpine container for cleanup helper operations..."
+
+  # Create a unique name for the container based on date and a random string
+  local container_name="docker_volume_cleanup_$(date +%Y%m%d%H%M%S)_$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 6 | head -n 1)"
+
+  # Create a long-running container with useful tools installed
+  ALPINE_CONTAINER_ID=$(docker run -d \
+    --name "$container_name" \
+    alpine sh -c "apk add --no-cache coreutils findutils && tail -f /dev/null")
+
+  if [ -z "$ALPINE_CONTAINER_ID" ] || ! docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
+    log "ERROR" "Failed to create Alpine container for cleanup operations"
+    echo "ERROR: Failed to create Alpine container"
+    return 1
+  fi
+
+  log "INFO" "Alpine container created: $container_name ($ALPINE_CONTAINER_ID)"
+  return 0
+}
+
+# Function to remove Alpine container
+remove_alpine_container() {
+  if [ -n "$ALPINE_CONTAINER_ID" ] && docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
+    log "INFO" "Removing Alpine container..."
+    if ! docker rm -f "$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
+      log "WARNING" "Failed to remove Alpine container $ALPINE_CONTAINER_ID"
+    else
+      log "INFO" "Alpine container removed successfully"
+    fi
+  fi
+}
+
+# Function to ensure the Alpine container is removed on script exit or error
+cleanup_on_exit() {
+  log "INFO" "Running cleanup on exit..."
+  remove_alpine_container
+  log "INFO" "Cleanup completed"
+}
+
+# Register trap for cleanup
+trap cleanup_on_exit EXIT INT TERM
+
 # If no options provided, show usage
 if [ "$CLEAN_VOLUMES" = false ] && [ "$CLEAN_IMAGES" = false ] && [ "$CLEAN_CONTAINERS" = false ] && [ "$CLEAN_NETWORKS" = false ] && [ "$CLEAN_BUILDER" = false ] && [ "$CLEAN_TEMP_VOLUMES" = false ] && [ "$CLEAN_ALL" = false ] && [ "$PRUNE_ALL" = false ]; then
   echo "No cleanup options specified."
@@ -166,6 +213,22 @@ verify_permissions() {
   fi
 
   log "INFO" "Docker access verified."
+}
+
+# Helper function to ask for confirmation
+confirm_action() {
+  local message="$1"
+
+  if [ "$FORCE" = true ]; then
+    return 0
+  fi
+
+  read -p "$message (y/n): " confirm
+  if [ "$confirm" = "y" ]; then
+    return 0
+  else
+    return 1
+  fi
 }
 
 # Clean unused volumes
@@ -207,14 +270,11 @@ clean_volumes() {
     return 0
   fi
 
-  # Ask for confirmation unless force mode is enabled
-  if [ "$FORCE" != true ]; then
-    read -p "Remove ${#unused_volumes[@]} unused volumes? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-      log "INFO" "Volume cleanup canceled by user"
-      echo "Volume cleanup canceled."
-      return 0
-    fi
+  # Ask for confirmation
+  if ! confirm_action "Remove ${#unused_volumes[@]} unused volumes?"; then
+    log "INFO" "Volume cleanup canceled by user"
+    echo "Volume cleanup canceled."
+    return 0
   fi
 
   # Remove unused volumes
@@ -259,14 +319,16 @@ clean_temp_volumes() {
     return 0
   fi
 
-  # Ask for confirmation unless force mode is enabled
-  if [ "$FORCE" != true ]; then
-    read -p "Remove $temp_volume_count temporary volumes? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-      log "INFO" "Temporary volume cleanup canceled by user"
-      echo "Temporary volume cleanup canceled."
-      return 0
-    fi
+  # Ask for confirmation
+  if ! confirm_action "Remove $temp_volume_count temporary volumes?"; then
+    log "INFO" "Temporary volume cleanup canceled by user"
+    echo "Temporary volume cleanup canceled."
+    return 0
+  fi
+
+  # Create Alpine container if needed for volume inspection
+  if [ "$DRY_RUN" != true ]; then
+    create_alpine_container
   fi
 
   # Remove temporary volumes
@@ -274,6 +336,15 @@ clean_temp_volumes() {
   local failed=0
 
   for volume in $temp_volumes; do
+    # Display volume information if available
+    if [ -n "$ALPINE_CONTAINER_ID" ]; then
+      # Mount volume to container and check contents
+      local file_count=$(docker run --rm -v "$volume:/vol_to_check" alpine sh -c "find /vol_to_check -type f | wc -l")
+      local size=$(docker run --rm -v "$volume:/vol_to_check" alpine sh -c "du -sh /vol_to_check | cut -f1")
+      log "INFO" "Temporary volume: $volume, Size: $size, Files: $file_count"
+      echo "  - $volume (Size: $size, Files: $file_count)"
+    fi
+
     log "INFO" "Removing temporary volume: $volume"
     if docker volume rm "$volume" >/dev/null 2>&1; then
       log "INFO" "Temporary volume $volume removed successfully"
@@ -310,14 +381,11 @@ clean_images() {
     return 0
   fi
 
-  # Ask for confirmation unless force mode is enabled
-  if [ "$FORCE" != true ]; then
-    read -p "Remove $image_count dangling images? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-      log "INFO" "Image cleanup canceled by user"
-      echo "Image cleanup canceled."
-      return 0
-    fi
+  # Ask for confirmation
+  if ! confirm_action "Remove $image_count dangling images?"; then
+    log "INFO" "Image cleanup canceled by user"
+    echo "Image cleanup canceled."
+    return 0
   fi
 
   # Remove dangling images
@@ -347,20 +415,23 @@ clean_containers() {
   local container_count=$(echo "$stopped_containers" | wc -l)
   echo "Found $container_count stopped container(s)"
 
+  # Show more details about the containers
+  if [ "$container_count" -gt 0 ]; then
+    echo "Details of stopped containers:"
+    docker ps -a -f "status=exited" --format "  - {{.Names}} (ID: {{.ID}}, Image: {{.Image}}, Exited: {{.Status}})"
+  fi
+
   # Exit here if dry run
   if [ "$DRY_RUN" = true ]; then
     log "INFO" "Dry run: would have removed $container_count stopped containers"
     return 0
   fi
 
-  # Ask for confirmation unless force mode is enabled
-  if [ "$FORCE" != true ]; then
-    read -p "Remove $container_count stopped containers? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-      log "INFO" "Container cleanup canceled by user"
-      echo "Container cleanup canceled."
-      return 0
-    fi
+  # Ask for confirmation
+  if ! confirm_action "Remove $container_count stopped containers?"; then
+    log "INFO" "Container cleanup canceled by user"
+    echo "Container cleanup canceled."
+    return 0
   fi
 
   # Remove stopped containers
@@ -371,6 +442,14 @@ clean_containers() {
   else
     log "WARNING" "Some stopped containers could not be removed"
     echo "Some stopped containers could not be removed"
+
+    # Try to show which ones failed
+    local remaining=$(docker ps -a -f "status=exited" -q)
+    if [ -n "$remaining" ]; then
+      local remaining_count=$(echo "$remaining" | wc -l)
+      echo "Containers that could not be removed ($remaining_count):"
+      docker ps -a -f "status=exited" --format "  - {{.Names}} (ID: {{.ID}}, Image: {{.Image}})"
+    fi
   fi
 }
 
@@ -418,14 +497,11 @@ clean_networks() {
     return 0
   fi
 
-  # Ask for confirmation unless force mode is enabled
-  if [ "$FORCE" != true ]; then
-    read -p "Remove ${#unused_networks[@]} unused networks? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-      log "INFO" "Network cleanup canceled by user"
-      echo "Network cleanup canceled."
-      return 0
-    fi
+  # Ask for confirmation
+  if ! confirm_action "Remove ${#unused_networks[@]} unused networks?"; then
+    log "INFO" "Network cleanup canceled by user"
+    echo "Network cleanup canceled."
+    return 0
   fi
 
   # Remove unused networks
@@ -467,14 +543,11 @@ clean_builder() {
     return 0
   fi
 
-  # Ask for confirmation unless force mode is enabled
-  if [ "$FORCE" != true ]; then
-    read -p "Clean Docker builder cache? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-      log "INFO" "Builder cache cleanup canceled by user"
-      echo "Builder cache cleanup canceled."
-      return 0
-    fi
+  # Ask for confirmation
+  if ! confirm_action "Clean Docker builder cache?"; then
+    log "INFO" "Builder cache cleanup canceled by user"
+    echo "Builder cache cleanup canceled."
+    return 0
   fi
 
   # Clean builder cache
@@ -498,20 +571,18 @@ run_system_prune() {
     return 0
   fi
 
-  # Ask for confirmation unless force mode is enabled
-  if [ "$FORCE" != true ]; then
-    echo "CAUTION: Docker system prune with --all --volumes will remove:"
-    echo "  - all stopped containers"
-    echo "  - all networks not used by at least one container"
-    echo "  - all volumes not used by at least one container"
-    echo "  - all images without at least one container associated to them"
-    echo "  - all build cache"
-    read -p "This operation cannot be undone. Continue? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-      log "INFO" "System prune canceled by user"
-      echo "System prune canceled."
-      return 0
-    fi
+  # Ask for confirmation
+  echo "CAUTION: Docker system prune with --all --volumes will remove:"
+  echo "  - all stopped containers"
+  echo "  - all networks not used by at least one container"
+  echo "  - all volumes not used by at least one container"
+  echo "  - all images without at least one container associated to them"
+  echo "  - all build cache"
+
+  if ! confirm_action "This operation cannot be undone. Continue?"; then
+    log "INFO" "System prune canceled by user"
+    echo "System prune canceled."
+    return 0
   fi
 
   # Run system prune
@@ -520,6 +591,40 @@ run_system_prune() {
 
   log "INFO" "System prune completed"
   echo "System prune completed"
+}
+
+# Display system information
+show_system_information() {
+  log "INFO" "Collecting Docker system information..."
+  echo ""
+  echo "Docker System Information:"
+  echo "-------------------------"
+
+  # Docker version info
+  echo "Docker Version:"
+  docker version --format 'Client: {{.Client.Version}}, Server: {{.Server.Version}}'
+
+  # System disk usage
+  echo ""
+  echo "Docker Disk Usage Summary:"
+  docker system df
+
+  # Current resources
+  echo ""
+  echo "Current Resources:"
+  echo "  Images: $(docker images -q | wc -l)"
+  echo "  Containers (all): $(docker ps -a -q | wc -l)"
+  echo "  Containers (running): $(docker ps -q | wc -l)"
+  echo "  Volumes: $(docker volume ls -q | wc -l)"
+  echo "  Networks: $(docker network ls -q | wc -l)"
+
+  if command -v df >/dev/null 2>&1; then
+    echo ""
+    echo "Host Disk Usage:"
+    df -h $(docker info --format '{{.DockerRootDir}}' | cut -d':' -f1) | head -2
+  fi
+
+  echo ""
 }
 
 # Main execution
@@ -535,6 +640,9 @@ if [ "$DRY_RUN" = true ]; then
   echo "DRY RUN MODE: No resources will be removed"
   log "INFO" "Running in dry run mode"
 fi
+
+# Show system information first
+show_system_information
 
 # Run selected cleanup operations
 if [ "$PRUNE_ALL" = true ]; then

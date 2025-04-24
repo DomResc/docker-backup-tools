@@ -41,6 +41,9 @@ declare -A VOLUME_BACKUP_STATUS
 declare -A CONTAINERS_TO_RESTART
 declare -A VOLUMES_BY_CONTAINER
 
+# Global container ID for the Alpine container used for backups
+ALPINE_CONTAINER_ID=""
+
 # Parse command line arguments
 usage() {
   echo "Usage: $0 [OPTIONS]"
@@ -144,6 +147,41 @@ log() {
   local message="$2"
   local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
   echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+# Function to create and prepare Alpine container
+create_alpine_container() {
+  log "INFO" "Creating Alpine container for backup operations..."
+
+  # Create a unique name for the container based on date and a random string
+  local container_name="docker_volume_backup_${DATE}_$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 6 | head -n 1)"
+
+  # Create a long-running container with pigz installed
+  ALPINE_CONTAINER_ID=$(docker run -d \
+    --name "$container_name" \
+    -v "$BACKUP_DIR:/backup" \
+    alpine sh -c "apk add --no-cache pigz && tail -f /dev/null")
+
+  if [ -z "$ALPINE_CONTAINER_ID" ] || ! docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
+    log "ERROR" "Failed to create Alpine container for backup operations"
+    echo "ERROR: Failed to create backup container"
+    return 1
+  fi
+
+  log "INFO" "Alpine container created: $container_name ($ALPINE_CONTAINER_ID)"
+  return 0
+}
+
+# Function to remove Alpine container
+remove_alpine_container() {
+  if [ -n "$ALPINE_CONTAINER_ID" ] && docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
+    log "INFO" "Removing Alpine container..."
+    if ! docker rm -f "$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
+      log "WARNING" "Failed to remove Alpine container $ALPINE_CONTAINER_ID"
+    else
+      log "INFO" "Alpine container removed successfully"
+    fi
+  fi
 }
 
 # Verify that the script is executed with necessary permissions
@@ -269,26 +307,26 @@ verify_backup() {
 
   log "INFO" "Verifying backup integrity: $backup_file"
 
-  # Fast verification of gzip integrity without full decompression
-  if gzip -t "$backup_file" 2>/dev/null; then
-    # Quick check of tar header by just looking at the first few entries
-    if tar -tzf "$backup_file" 2>/dev/null | head -n 5 >/dev/null; then
-      # Get a quick file count by sampling (much faster than counting all files)
-      local file_sample=$(tar -tzf "$backup_file" 2>/dev/null | head -n 20)
-
-      if [ -n "$file_sample" ]; then
-        log "INFO" "Integrity verification passed for $volume_name"
-        return 0
-      else
-        log "ERROR" "Backup appears to be empty for $volume_name"
-        return 1
-      fi
-    else
-      log "ERROR" "Backup verification failed for $volume_name. Invalid tar format."
-      return 1
-    fi
-  else
+  # Use the Alpine container to verify backup integrity
+  if ! docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -t /backup/$DATE/$(basename "$backup_file") 2>/dev/null"; then
     log "ERROR" "Integrity verification failed for $volume_name. Invalid gzip format."
+    return 1
+  fi
+
+  # Check tar header structure
+  if ! docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -dc /backup/$DATE/$(basename "$backup_file") 2>/dev/null | tar -t 2>&1 | head -n 5 >/dev/null"; then
+    log "ERROR" "Backup verification failed for $volume_name. Invalid tar format."
+    return 1
+  fi
+
+  # Get a quick file count by sampling
+  local file_sample=$(docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -dc /backup/$DATE/$(basename "$backup_file") 2>/dev/null | tar -t 2>/dev/null | head -n 20")
+
+  if [ -n "$file_sample" ]; then
+    log "INFO" "Integrity verification passed for $volume_name"
+    return 0
+  else
+    log "ERROR" "Backup appears to be empty for $volume_name"
     return 1
   fi
 }
@@ -460,13 +498,16 @@ cleanup_on_exit() {
   # Then try the old system as fallback
   restart_all_containers
 
+  # Remove the Alpine container if it exists
+  remove_alpine_container
+
   log "INFO" "Cleanup completed"
 }
 
 # Function to perform backup of a single volume
 backup_volume() {
   local volume="$1"
-  local backup_file="$BACKUP_DATE_DIR/$volume.tar.gz"
+  local backup_file="$volume.tar.gz"
 
   log "INFO" "Starting backup of volume: $volume"
 
@@ -495,11 +536,11 @@ backup_volume() {
     return 1
   fi
 
-  # Run the backup command with pigz (optimized)
+  # Run the backup command using our persistent Alpine container
   if docker run --rm \
     -v "$volume:/source:ro" \
-    -v "$BACKUP_DIR:/backup" \
-    alpine sh -c "apk add --no-cache pigz && tar -cf - -C /source . | pigz -$COMPRESSION > '/backup/$DATE/$volume.tar.gz'"; then
+    --volumes-from "$ALPINE_CONTAINER_ID" \
+    alpine sh -c "tar -cf - -C /source . | pigz -$COMPRESSION > '/backup/$DATE/$backup_file'"; then
 
     backup_end_time=$(date +%s)
     backup_duration=$((backup_end_time - backup_start_time))
@@ -519,8 +560,9 @@ backup_volume() {
   fi
 
   # Calculate and display backup size
-  if [ -f "$backup_file" ]; then
-    BACKUP_SIZE=$(du -h "$backup_file" | cut -f1)
+  local backup_full_path="$BACKUP_DATE_DIR/$backup_file"
+  if [ -f "$backup_full_path" ]; then
+    BACKUP_SIZE=$(du -h "$backup_full_path" | cut -f1)
     log "INFO" "Backup size for $volume: $BACKUP_SIZE"
   fi
 
@@ -563,6 +605,7 @@ trap cleanup_on_exit EXIT INT TERM
 
 # Create log file if it doesn't exist
 if [ ! -f "$LOG_FILE" ]; then
+  mkdir -p $(dirname "$LOG_FILE")
   touch "$LOG_FILE"
   log "INFO" "Log file created at $LOG_FILE"
 fi
@@ -702,6 +745,12 @@ fi
 # Check system resources after determining which volumes to backup
 check_resources
 
+# Create the Alpine container for all backup operations
+if ! create_alpine_container; then
+  log "ERROR" "Failed to create Alpine container. Exiting."
+  exit 1
+fi
+
 # Reorganize volumes: regular volumes first, last priority volumes at the end
 REGULAR_VOLUMES=()
 LAST_VOLUMES=()
@@ -784,7 +833,7 @@ log "INFO" "Total volumes processed: $TOTAL_VOLUMES"
 log "INFO" "Backups completed successfully: $SUCCESSFUL_BACKUPS"
 log "INFO" "Failed backups: $FAILED_BACKUPS"
 log "INFO" "Skipped volumes: $SKIPPED_VOLUMES"
-log "INFO" "Total space used: $(du -sh $BACKUP_DIR | cut -f1)"
+log "INFO" "Total space used: $(du -sh $BACKUP_DATE_DIR | cut -f1)"
 log "INFO" "Backup completed!"
 log "INFO" "============================================"
 
