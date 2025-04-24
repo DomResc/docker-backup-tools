@@ -10,7 +10,7 @@ A set of bash utilities for backing up, restoring, and cleaning Docker volumes r
 - **Priority Backup Ordering**: Specify containers to backup last (useful for critical infrastructure services like DNS)
 - **Efficient Compression**: Uses parallel compression (pigz) for better performance
 - **Single Container Optimization**: Uses a single Alpine container for all operations, reducing overhead
-- **Backup Integrity Verification**: Fast verification of backup integrity to ensure successful restoration
+- **Fast Backup Verification**: Optimized quick verification of backup integrity with minimal overhead
 - **Retention Policy**: Automatically removes backups older than a specified number of days
 - **Full CLI Support**: Comprehensive command-line options and environment variable integration
 - **Interactive Restoration**: User-friendly interactive mode for selecting backups to restore
@@ -189,7 +189,7 @@ export DOCKER_PARALLEL_JOBS="4"
    - Asks for confirmation before stopping containers (unless `-f/--force` is used)
    - Stops containers if necessary
    - Creates compressed archive of volume data with specified compression level
-   - Performs fast verification of backup integrity
+   - Performs fast verification of backup integrity (optimized to minimize verification time)
    - Records backup statistics (size, duration, etc.)
 8. Then processes priority volumes (those used by critical containers)
 9. Restarts all affected containers after all volume backups are complete
@@ -231,7 +231,7 @@ export DOCKER_PARALLEL_JOBS="4"
 - **Single Container Reuse**: Uses a single Alpine container for all backup/restore operations
 - **Parallel Volume Processing**: Process multiple volumes simultaneously with the `--jobs` option
 - **Memory-Aware Execution**: Automatically adjusts parallelism based on available system memory
-- **Fast Integrity Verification**: Optimized backup verification that doesn't require full decompression
+- **Fast Integrity Verification**: Uses efficient sampling techniques to verify backup integrity with minimal overhead
 - **Metadata Caching**: Reduces Docker API calls by caching container and volume information
 - **Efficient Container Management**: Safely stops and restarts only the containers that need it
 - **Optimized Compression**: Uses pigz (parallel gzip) for multi-threaded compression
@@ -314,6 +314,12 @@ export DOCKER_PARALLEL_JOBS="4"
 - Use a lower compression level (1-3) for faster backups
 - Store backups on SSD rather than HDD
 - Consider backing up fewer volumes at once
+
+**Problem: Verification is taking too long**
+
+- The backup verification has been optimized for speed in the latest version
+- If you're still experiencing slow verification, try updating to the latest version
+- Verification now uses efficient sampling to validate backup integrity with minimal overhead
 
 ## Contributing
 

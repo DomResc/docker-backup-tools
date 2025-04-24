@@ -300,34 +300,45 @@ check_resources() {
   fi
 }
 
-# Function to verify backup integrity - optimized version
+# Function to verify backup integrity
 verify_backup() {
   local backup_file="$1"
   local volume_name="$2"
 
   log "INFO" "Verifying backup integrity: $backup_file"
 
-  # Use the Alpine container to verify backup integrity
-  if ! docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -t /backup/$DATE/$(basename "$backup_file") 2>/dev/null"; then
+  # Use the Alpine container for a fast integrity check of the gzip format
+  # This only checks the header and footer, not the entire file content
+  if ! docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -t -q /backup/$DATE/$(basename "$backup_file") 2>/dev/null"; then
     log "ERROR" "Integrity verification failed for $volume_name. Invalid gzip format."
     return 1
   fi
 
-  # Check tar header structure
-  if ! docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -dc /backup/$DATE/$(basename "$backup_file") 2>/dev/null | tar -t 2>&1 | head -n 5 >/dev/null"; then
+  # Instead of extracting the entire archive, just check the first few bytes
+  # to ensure it's a valid tar file and contains at least one entry
+  if ! docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -dc /backup/$DATE/$(basename "$backup_file") 2>/dev/null | dd bs=4k count=1 2>/dev/null | tar -t >/dev/null 2>&1"; then
     log "ERROR" "Backup verification failed for $volume_name. Invalid tar format."
     return 1
   fi
 
-  # Get a quick file count by sampling
-  local file_sample=$(docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -dc /backup/$DATE/$(basename "$backup_file") 2>/dev/null | tar -t 2>/dev/null | head -n 20")
+  # Get a quick directory count from the beginning of the archive
+  # This is much faster than counting all files
+  local dir_sample=$(docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -dc /backup/$DATE/$(basename "$backup_file") 2>/dev/null | tar -t 2>/dev/null | head -n 5 | grep -v '/$' | wc -l")
 
-  if [ -n "$file_sample" ]; then
-    log "INFO" "Integrity verification passed for $volume_name"
+  if [ "$dir_sample" -gt 0 ]; then
+    log "INFO" "Integrity verification passed for $volume_name (fast check)"
     return 0
   else
-    log "ERROR" "Backup appears to be empty for $volume_name"
-    return 1
+    # If no files found in the first few entries, check a bit further
+    local extended_check=$(docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -dc /backup/$DATE/$(basename "$backup_file") 2>/dev/null | tar -t 2>/dev/null | head -n 50 | grep -v '/$' | wc -l")
+
+    if [ "$extended_check" -gt 0 ]; then
+      log "INFO" "Integrity verification passed for $volume_name (extended check)"
+      return 0
+    else
+      log "ERROR" "Backup appears to be empty or contains only directories for $volume_name"
+      return 1
+    fi
   fi
 }
 
