@@ -502,12 +502,6 @@ cleanup_on_exit() {
   # Then try the old system as fallback
   restart_all_containers
 
-  # Clean up any temporary files
-  if [ -f "$BACKUP_DATE_DIR/temp_backup.tar" ]; then
-    rm -f "$BACKUP_DATE_DIR/temp_backup.tar"
-    log "INFO" "Removed temporary tar file"
-  fi
-
   log "INFO" "Cleanup completed"
 }
 
@@ -546,51 +540,39 @@ backup_volume() {
   # Full path to backup file
   local backup_file_path="$BACKUP_DATE_DIR/$backup_file"
 
-  # Run the backup using the appropriate method based on pigz availability
+  # Run the backup using direct pipeline to avoid permission issues with temporary files
   if [ "$PIGZ_AVAILABLE" = true ]; then
-    # Use pigz for compression (two-step process)
-    log "INFO" "Using pigz for compression"
+    # Use pigz for compression with direct pipe
+    log "INFO" "Using pigz for compression with direct pipe"
 
-    # Step 1: Create tar from volume
     if docker run --rm \
       -v "$volume:/source:ro" \
-      -v "$BACKUP_DATE_DIR:/backup_dir" \
-      alpine sh -c "tar -cf - -C /source . > /backup_dir/temp_backup.tar"; then
+      alpine sh -c "tar -cf - -C /source ." |
+      pigz -$COMPRESSION >"$backup_file_path"; then
 
-      # Step 2: Compress the tar file with pigz
-      if pigz -$COMPRESSION -c "$BACKUP_DATE_DIR/temp_backup.tar" >"$backup_file_path"; then
-        # Remove temporary tar file
-        rm "$BACKUP_DATE_DIR/temp_backup.tar"
+      backup_end_time=$(date +%s)
+      backup_duration=$((backup_end_time - backup_start_time))
+      log "INFO" "Backup of volume $volume completed in $backup_duration seconds: $backup_file"
 
-        backup_end_time=$(date +%s)
-        backup_duration=$((backup_end_time - backup_start_time))
-        log "INFO" "Backup of volume $volume completed in $backup_duration seconds: $backup_file"
-
-        # Verify backup integrity
-        if verify_backup "$backup_file" "$volume"; then
-          VOLUME_BACKUP_STATUS["$volume"]="SUCCESS"
-        else
-          log "ERROR" "Backup verification failed for $volume"
-          VOLUME_BACKUP_STATUS["$volume"]="FAILED-VERIFICATION"
-        fi
+      # Verify backup integrity
+      if verify_backup "$backup_file" "$volume"; then
+        VOLUME_BACKUP_STATUS["$volume"]="SUCCESS"
       else
-        log "ERROR" "Compression of backup for volume $volume failed"
-        VOLUME_BACKUP_STATUS["$volume"]="FAILED"
-        # Cleanup temporary tar file
-        rm -f "$BACKUP_DATE_DIR/temp_backup.tar"
+        log "ERROR" "Backup verification failed for $volume"
+        VOLUME_BACKUP_STATUS["$volume"]="FAILED-VERIFICATION"
       fi
     else
-      log "ERROR" "Backup of volume $volume failed during tar creation"
+      log "ERROR" "Backup of volume $volume failed"
       VOLUME_BACKUP_STATUS["$volume"]="FAILED"
     fi
   else
-    # Use gzip for compression (one-step process)
-    log "INFO" "Using gzip for compression"
+    # Use gzip for compression with direct pipe
+    log "INFO" "Using gzip for compression with direct pipe"
 
     if docker run --rm \
       -v "$volume:/source:ro" \
-      -v "$BACKUP_DATE_DIR:/backup_dir" \
-      alpine sh -c "tar -cf - -C /source . | gzip -$COMPRESSION > /backup_dir/$backup_file"; then
+      alpine sh -c "tar -cf - -C /source ." |
+      gzip -$COMPRESSION >"$backup_file_path"; then
 
       backup_end_time=$(date +%s)
       backup_duration=$((backup_end_time - backup_start_time))
