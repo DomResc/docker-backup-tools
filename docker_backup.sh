@@ -160,11 +160,7 @@ create_alpine_container() {
   ALPINE_CONTAINER_ID=$(docker run -d \
     --name "$container_name" \
     -v "$BACKUP_DIR:/backup" \
-    alpine sh -c "for retry in 1 2 3 4 5; do 
-    echo 'Attempt $retry to update and install pigz' && 
-    (apk update && apk add --no-cache pigz && echo 'PIGZ_INSTALLED=true' && break) || 
-    (echo 'Failed attempt $retry - waiting before retry' && sleep 5); 
-  done && tail -f /dev/null")
+    alpine sh -c "apk update && apk add --no-cache pigz && echo 'PIGZ_INSTALLED=true' && tail -f /dev/null")
 
   if [ -z "$ALPINE_CONTAINER_ID" ] || ! docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
     log "ERROR" "Failed to create Alpine container for backup operations"
