@@ -8,8 +8,7 @@ A set of bash utilities for backing up, restoring, and cleaning Docker volumes r
 - **Intelligent Container Handling**: Automatically stops and restarts containers when necessary
 - **Parallel Processing**: Backup multiple volumes simultaneously for improved performance
 - **Priority Backup Ordering**: Specify containers to backup last (useful for critical infrastructure services like DNS)
-- **Efficient Compression**: Uses parallel compression (pigz) for better performance
-- **Single Container Optimization**: Uses a single Alpine container for all operations, reducing overhead
+- **Host-based Compression**: Uses host system's parallel compression (pigz) for better performance with graceful fallback to gzip
 - **Fast Backup Verification**: Optimized quick verification of backup integrity with minimal overhead
 - **Retention Policy**: Automatically removes backups older than a specified number of days
 - **Full CLI Support**: Comprehensive command-line options and environment variable integration
@@ -30,6 +29,16 @@ cd docker-volume-tools
 
 # Make scripts executable
 chmod +x docker_backup.sh docker_restore.sh docker_cleanup.sh
+
+# Install pigz for optimal compression performance (recommended)
+# On Debian/Ubuntu:
+sudo apt-get install pigz
+# On CentOS/RHEL:
+sudo yum install pigz
+# On Alpine Linux:
+apk add pigz
+# On macOS:
+brew install pigz
 ```
 
 ## Backup Usage
@@ -171,6 +180,7 @@ export DOCKER_PARALLEL_JOBS="4"
 - Sufficient disk space for backups (at least 500MB free plus estimated backup size)
 - Sufficient memory for parallel operations (auto-adjusts based on available memory)
 - Basic bash utilities (find, sed, etc.)
+- pigz installed on the host system for optimal compression performance (falls back to gzip if not available)
 - The script will automatically verify these prerequisites before running
 
 ## How It Works
@@ -178,17 +188,17 @@ export DOCKER_PARALLEL_JOBS="4"
 ### Backup Process
 
 1. Verifies prerequisites (Docker access, permissions, disk space, memory)
-2. Identifies volumes to back up (all or specified with the `-v` option)
-3. Estimates disk space requirements and verifies sufficient free space
-4. Maps containers to volumes for efficient stopping/starting
-5. Identifies containers that should be processed last (via `--prioritize-last` option)
-6. Creates a single Alpine container with pigz installed for all compression operations
+2. Checks for pigz availability on the host system (falls back to gzip if not available)
+3. Identifies volumes to back up (all or specified with the `-v` option)
+4. Estimates disk space requirements and verifies sufficient free space
+5. Maps containers to volumes for efficient stopping/starting
+6. Identifies containers that should be processed last (via `--prioritize-last` option)
 7. Processes regular volumes first (in parallel batches):
    - Identifies containers using the volume
    - Skips the volume if the `-s/--skip-used` option is enabled and the volume is in use
    - Asks for confirmation before stopping containers (unless `-f/--force` is used)
    - Stops containers if necessary
-   - Creates compressed archive of volume data with specified compression level
+   - Creates compressed archive of volume data with specified compression level using host system's pigz/gzip
    - Performs fast verification of backup integrity (optimized to minimize verification time)
    - Records backup statistics (size, duration, etc.)
 8. Then processes priority volumes (those used by critical containers)
@@ -199,17 +209,18 @@ export DOCKER_PARALLEL_JOBS="4"
 ### Restore Process
 
 1. Verifies prerequisites (Docker access, permissions, disk space)
-2. Shows list of available backup dates (or uses specified date with `-b` option)
-3. Shows list of volumes available in the selected backup
-4. Creates a single Alpine container with pigz installed for all decompression operations
+2. Checks for pigz availability on the host system (falls back to gzip if not available)
+3. Shows list of available backup dates (or uses specified date with `-b` option)
+4. Shows list of volumes available in the selected backup
 5. Verifies backup integrity and content before restoration
 6. Creates a temporary volume to test the backup restoration first
 7. Identifies and stops only running containers that use the volume
 8. Clears the target volume to ensure clean state
-9. Performs data restoration with detailed progress indication
-10. Verifies restored data with file count checks
-11. Restarts containers that were previously running
-12. Removes the temporary test volume if successful
+9. Decompresses the backup archive using the host system's pigz/gzip
+10. Performs data restoration with detailed progress indication
+11. Verifies restored data with file count checks
+12. Restarts containers that were previously running
+13. Removes the temporary test volume if successful
 
 ### Cleanup Process
 
@@ -228,13 +239,12 @@ export DOCKER_PARALLEL_JOBS="4"
 
 ## Performance Optimizations
 
-- **Single Container Reuse**: Uses a single Alpine container for all backup/restore operations
+- **Host-based Compression**: Uses host system's pigz for efficient parallel compression/decompression
 - **Parallel Volume Processing**: Process multiple volumes simultaneously with the `--jobs` option
 - **Memory-Aware Execution**: Automatically adjusts parallelism based on available system memory
 - **Fast Integrity Verification**: Uses efficient sampling techniques to verify backup integrity with minimal overhead
 - **Metadata Caching**: Reduces Docker API calls by caching container and volume information
 - **Efficient Container Management**: Safely stops and restarts only the containers that need it
-- **Optimized Compression**: Uses pigz (parallel gzip) for multi-threaded compression
 - **Delayed Container Restart**: Restarts containers only after all volumes are processed
 
 ## Best Practices
@@ -252,6 +262,7 @@ export DOCKER_PARALLEL_JOBS="4"
 - Run cleanup regularly with dry-run first to understand what will be removed
 - Use specific cleanup options instead of `--prune-all` in production environments
 - Use the `--prioritize-last` option for critical infrastructure containers like DNS servers to minimize service disruption
+- Install pigz on your host system for optimal backup and restore performance
 
 ## Security Considerations
 
@@ -298,6 +309,15 @@ export DOCKER_PARALLEL_JOBS="4"
 - Try restarting it with `docker start <container_name>`
 - Check logs with `docker logs <container_name>`
 
+**Error: pigz not found**
+
+- Install pigz on your host system:
+  - Debian/Ubuntu: `sudo apt-get install pigz`
+  - CentOS/RHEL: `sudo yum install pigz`
+  - Alpine Linux: `apk add pigz`
+  - macOS: `brew install pigz`
+- Alternatively, continue without pigz (the script will fall back to gzip)
+
 **Error: Temporary volume creation failed**
 
 - Check Docker volume driver status
@@ -310,6 +330,7 @@ export DOCKER_PARALLEL_JOBS="4"
 
 **Problem: Backup is running slowly**
 
+- Ensure pigz is installed on your host system for faster compression
 - Increase the number of parallel jobs with `--jobs` option
 - Use a lower compression level (1-3) for faster backups
 - Store backups on SSD rather than HDD

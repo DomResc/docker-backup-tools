@@ -41,8 +41,8 @@ declare -A VOLUME_BACKUP_STATUS
 declare -A CONTAINERS_TO_RESTART
 declare -A VOLUMES_BY_CONTAINER
 
-# Global container ID for the Alpine container used for backups
-ALPINE_CONTAINER_ID=""
+# Flag to track if pigz is available on the host system
+PIGZ_AVAILABLE=false
 
 # Parse command line arguments
 usage() {
@@ -149,39 +149,29 @@ log() {
   echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
 }
 
-# Function to create and prepare Alpine container
-create_alpine_container() {
-  log "INFO" "Creating Alpine container for backup operations..."
-
-  # Create a unique name for the container based on date and a random string
-  local container_name="docker_volume_backup_${DATE}_$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 6 | head -n 1)"
-
-  # Create a long-running container with pigz installed
-  ALPINE_CONTAINER_ID=$(docker run -d \
-    --name "$container_name" \
-    -v "$BACKUP_DIR:/backup" \
-    alpine sh -c "apk add --no-cache pigz && tail -f /dev/null")
-
-  if [ -z "$ALPINE_CONTAINER_ID" ] || ! docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
-    log "ERROR" "Failed to create Alpine container for backup operations"
-    echo "ERROR: Failed to create backup container"
+# Function to check if pigz is installed on the host system
+check_pigz_installation() {
+  if ! command -v pigz &>/dev/null; then
+    log "WARNING" "pigz is not installed on the host system"
+    echo "WARNING: pigz is not installed on the host system."
+    echo "pigz is required for efficient parallel compression of backups."
+    echo ""
+    echo "To install pigz:"
+    echo "  - On Debian/Ubuntu: sudo apt-get install pigz"
+    echo "  - On CentOS/RHEL: sudo yum install pigz"
+    echo "  - On Alpine Linux: apk add pigz"
+    echo "  - On macOS: brew install pigz"
+    echo ""
+    read -p "Would you like to continue without pigz (will use gzip instead)? (y/n): " continue_without_pigz
+    if [ "$continue_without_pigz" != "y" ]; then
+      log "INFO" "Backup canceled by user due to missing pigz"
+      exit 1
+    fi
+    log "INFO" "Continuing with gzip instead of pigz"
     return 1
   fi
-
-  log "INFO" "Alpine container created: $container_name ($ALPINE_CONTAINER_ID)"
+  log "INFO" "pigz is installed on the host system"
   return 0
-}
-
-# Function to remove Alpine container
-remove_alpine_container() {
-  if [ -n "$ALPINE_CONTAINER_ID" ] && docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
-    log "INFO" "Removing Alpine container..."
-    if ! docker rm -f "$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
-      log "WARNING" "Failed to remove Alpine container $ALPINE_CONTAINER_ID"
-    else
-      log "INFO" "Alpine container removed successfully"
-    fi
-  fi
 }
 
 # Verify that the script is executed with necessary permissions
@@ -307,38 +297,41 @@ verify_backup() {
 
   log "INFO" "Verifying backup integrity: $backup_file"
 
-  # Use the Alpine container for a fast integrity check of the gzip format
-  # This only checks the header and footer, not the entire file content
-  if ! docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -t -q /backup/$DATE/$(basename "$backup_file") 2>/dev/null"; then
-    log "ERROR" "Integrity verification failed for $volume_name. Invalid gzip format."
+  # Check if the backup file exists and is not empty
+  if [ ! -f "$BACKUP_DATE_DIR/$backup_file" ] || [ ! -s "$BACKUP_DATE_DIR/$backup_file" ]; then
+    log "ERROR" "Backup file is missing or empty: $backup_file"
     return 1
   fi
 
-  # Instead of extracting the entire archive, just check the first few bytes
-  # to ensure it's a valid tar file and contains at least one entry
-  if ! docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -dc /backup/$DATE/$(basename "$backup_file") 2>/dev/null | dd bs=4k count=1 2>/dev/null | tar -t >/dev/null 2>&1"; then
-    log "ERROR" "Backup verification failed for $volume_name. Invalid tar format."
-    return 1
-  fi
-
-  # Get a quick directory count from the beginning of the archive
-  # This is much faster than counting all files
-  local dir_sample=$(docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -dc /backup/$DATE/$(basename "$backup_file") 2>/dev/null | tar -t 2>/dev/null | head -n 5 | grep -v '/$' | wc -l")
-
-  if [ "$dir_sample" -gt 0 ]; then
-    log "INFO" "Integrity verification passed for $volume_name (fast check)"
-    return 0
-  else
-    # If no files found in the first few entries, check a bit further
-    local extended_check=$(docker exec "$ALPINE_CONTAINER_ID" sh -c "pigz -dc /backup/$DATE/$(basename "$backup_file") 2>/dev/null | tar -t 2>/dev/null | head -n 50 | grep -v '/$' | wc -l")
-
-    if [ "$extended_check" -gt 0 ]; then
-      log "INFO" "Integrity verification passed for $volume_name (extended check)"
-      return 0
-    else
-      log "ERROR" "Backup appears to be empty or contains only directories for $volume_name"
+  # Use the appropriate tool based on availability
+  if [ "$PIGZ_AVAILABLE" = true ]; then
+    # Check integrity with pigz
+    if ! pigz -t "$BACKUP_DATE_DIR/$backup_file" 2>/dev/null; then
+      log "ERROR" "Integrity verification failed for $volume_name. Invalid compressed format."
       return 1
     fi
+  else
+    # Check integrity with gzip
+    if ! gzip -t "$BACKUP_DATE_DIR/$backup_file" 2>/dev/null; then
+      log "ERROR" "Integrity verification failed for $volume_name. Invalid compressed format."
+      return 1
+    fi
+  fi
+
+  # Quick check of the tar content (just list a few files)
+  local file_check
+  if [ "$PIGZ_AVAILABLE" = true ]; then
+    file_check=$(pigz -dc "$BACKUP_DATE_DIR/$backup_file" 2>/dev/null | tar -tf - 2>/dev/null | head -5 | wc -l)
+  else
+    file_check=$(gzip -dc "$BACKUP_DATE_DIR/$backup_file" 2>/dev/null | tar -tf - 2>/dev/null | head -5 | wc -l)
+  fi
+
+  if [ "$file_check" -gt 0 ]; then
+    log "INFO" "Integrity verification passed for $volume_name"
+    return 0
+  else
+    log "ERROR" "Backup appears to be empty or invalid for $volume_name"
+    return 1
   fi
 }
 
@@ -509,8 +502,11 @@ cleanup_on_exit() {
   # Then try the old system as fallback
   restart_all_containers
 
-  # Remove the Alpine container if it exists
-  remove_alpine_container
+  # Clean up any temporary files
+  if [ -f "$BACKUP_DATE_DIR/temp_backup.tar" ]; then
+    rm -f "$BACKUP_DATE_DIR/temp_backup.tar"
+    log "INFO" "Removed temporary tar file"
+  fi
 
   log "INFO" "Cleanup completed"
 }
@@ -547,27 +543,70 @@ backup_volume() {
     return 1
   fi
 
-  # Run the backup command using our persistent Alpine container
-  if docker run --rm \
-    -v "$volume:/source:ro" \
-    --volumes-from "$ALPINE_CONTAINER_ID" \
-    alpine sh -c "tar -cf - -C /source . | pigz -$COMPRESSION > '/backup/$DATE/$backup_file'"; then
+  # Full path to backup file
+  local backup_file_path="$BACKUP_DATE_DIR/$backup_file"
 
-    backup_end_time=$(date +%s)
-    backup_duration=$((backup_end_time - backup_start_time))
+  # Run the backup using the appropriate method based on pigz availability
+  if [ "$PIGZ_AVAILABLE" = true ]; then
+    # Use pigz for compression (two-step process)
+    log "INFO" "Using pigz for compression"
 
-    log "INFO" "Backup of volume $volume completed in $backup_duration seconds: $backup_file"
+    # Step 1: Create tar from volume
+    if docker run --rm \
+      -v "$volume:/source:ro" \
+      -v "$BACKUP_DATE_DIR:/backup_dir" \
+      alpine sh -c "tar -cf - -C /source . > /backup_dir/temp_backup.tar"; then
 
-    # Verify integrity
-    if verify_backup "$backup_file" "$volume"; then
-      VOLUME_BACKUP_STATUS["$volume"]="SUCCESS"
+      # Step 2: Compress the tar file with pigz
+      if pigz -$COMPRESSION -c "$BACKUP_DATE_DIR/temp_backup.tar" >"$backup_file_path"; then
+        # Remove temporary tar file
+        rm "$BACKUP_DATE_DIR/temp_backup.tar"
+
+        backup_end_time=$(date +%s)
+        backup_duration=$((backup_end_time - backup_start_time))
+        log "INFO" "Backup of volume $volume completed in $backup_duration seconds: $backup_file"
+
+        # Verify backup integrity
+        if verify_backup "$backup_file" "$volume"; then
+          VOLUME_BACKUP_STATUS["$volume"]="SUCCESS"
+        else
+          log "ERROR" "Backup verification failed for $volume"
+          VOLUME_BACKUP_STATUS["$volume"]="FAILED-VERIFICATION"
+        fi
+      else
+        log "ERROR" "Compression of backup for volume $volume failed"
+        VOLUME_BACKUP_STATUS["$volume"]="FAILED"
+        # Cleanup temporary tar file
+        rm -f "$BACKUP_DATE_DIR/temp_backup.tar"
+      fi
     else
-      log "ERROR" "Backup verification failed for $volume"
-      VOLUME_BACKUP_STATUS["$volume"]="FAILED-VERIFICATION"
+      log "ERROR" "Backup of volume $volume failed during tar creation"
+      VOLUME_BACKUP_STATUS["$volume"]="FAILED"
     fi
   else
-    log "ERROR" "Backup of volume $volume failed"
-    VOLUME_BACKUP_STATUS["$volume"]="FAILED"
+    # Use gzip for compression (one-step process)
+    log "INFO" "Using gzip for compression"
+
+    if docker run --rm \
+      -v "$volume:/source:ro" \
+      -v "$BACKUP_DATE_DIR:/backup_dir" \
+      alpine sh -c "tar -cf - -C /source . | gzip -$COMPRESSION > /backup_dir/$backup_file"; then
+
+      backup_end_time=$(date +%s)
+      backup_duration=$((backup_end_time - backup_start_time))
+      log "INFO" "Backup of volume $volume completed in $backup_duration seconds: $backup_file (using gzip)"
+
+      # Verify backup integrity
+      if verify_backup "$backup_file" "$volume"; then
+        VOLUME_BACKUP_STATUS["$volume"]="SUCCESS"
+      else
+        log "ERROR" "Backup verification failed for $volume"
+        VOLUME_BACKUP_STATUS["$volume"]="FAILED-VERIFICATION"
+      fi
+    else
+      log "ERROR" "Backup of volume $volume failed"
+      VOLUME_BACKUP_STATUS["$volume"]="FAILED"
+    fi
   fi
 
   # Calculate and display backup size
@@ -575,6 +614,8 @@ backup_volume() {
   if [ -f "$backup_full_path" ]; then
     BACKUP_SIZE=$(du -h "$backup_full_path" | cut -f1)
     log "INFO" "Backup size for $volume: $BACKUP_SIZE"
+  else
+    log "INFO" "Backup size for $volume: 0"
   fi
 
   restart_containers "$volume"
@@ -628,6 +669,11 @@ log "INFO" "==========================================="
 log "INFO" "Starting Docker volume backup on $DATE in directory $BACKUP_DATE_DIR"
 log "INFO" "Parallel jobs: $PARALLEL_JOBS"
 log "INFO" "==========================================="
+
+# Check if pigz is installed
+if check_pigz_installation; then
+  PIGZ_AVAILABLE=true
+fi
 
 # Cache Docker volumes information - improves performance for large systems
 log "INFO" "Retrieving volumes information..."
@@ -755,12 +801,6 @@ fi
 
 # Check system resources after determining which volumes to backup
 check_resources
-
-# Create the Alpine container for all backup operations
-if ! create_alpine_container; then
-  log "ERROR" "Failed to create Alpine container. Exiting."
-  exit 1
-fi
 
 # Reorganize volumes: regular volumes first, last priority volumes at the end
 REGULAR_VOLUMES=()
