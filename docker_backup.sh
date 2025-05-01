@@ -158,6 +158,7 @@ create_alpine_container() {
 
   # Create a long-running container with pigz installed
   ALPINE_CONTAINER_ID=$(docker run -d \
+    --dns 9.9.9.9 \
     --name "$container_name" \
     -v "$BACKUP_DIR:/backup" \
     alpine sh -c "apk update && apk add --no-cache pigz && echo 'PIGZ_INSTALLED=true' && tail -f /dev/null")
