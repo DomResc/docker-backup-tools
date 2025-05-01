@@ -162,6 +162,9 @@ create_alpine_container() {
     -v "$BACKUP_DIR:/backup" \
     alpine sh -c "apk update && apk add pigz && echo 'PIGZ_INSTALLED=true' && tail -f /dev/null")
 
+  echo "Container ID: $ALPINE_CONTAINER_ID"
+  docker logs "$ALPINE_CONTAINER_ID"
+
   if [ -z "$ALPINE_CONTAINER_ID" ] || ! docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
     log "ERROR" "Failed to create Alpine container for backup operations"
     echo "ERROR: Failed to create backup container"
