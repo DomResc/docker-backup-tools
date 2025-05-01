@@ -156,14 +156,13 @@ create_alpine_container() {
   # Create a unique name for the container based on date and a random string
   local container_name="docker_volume_backup_${DATE}_$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 6 | head -n 1)"
 
-  # Create a long-running container with pigz installed
+  # Create a long-running container with pigz installed - use Alpine 3.18 explicitly
   ALPINE_CONTAINER_ID=$(docker run -d \
     --name "$container_name" \
     -v "$BACKUP_DIR:/backup" \
-    alpine sh -c "apk update && apk add pigz && echo 'PIGZ_INSTALLED=true' && tail -f /dev/null")
-
-  echo "Container ID: $ALPINE_CONTAINER_ID"
-  docker logs "$ALPINE_CONTAINER_ID"
+    alpine:3.18 sh -c "echo 'http://dl-cdn.alpinelinux.org/alpine/v3.18/main' > /etc/apk/repositories && \
+                      echo 'http://dl-cdn.alpinelinux.org/alpine/v3.18/community' >> /etc/apk/repositories && \
+                      apk update && apk add --no-cache pigz && echo 'PIGZ_INSTALLED=true' && tail -f /dev/null")
 
   if [ -z "$ALPINE_CONTAINER_ID" ] || ! docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
     log "ERROR" "Failed to create Alpine container for backup operations"
@@ -171,9 +170,28 @@ create_alpine_container() {
     return 1
   fi
 
-  # Verify that pigz was actually installed
-  if ! docker exec "$ALPINE_CONTAINER_ID" sh -c "command -v pigz" >/dev/null 2>&1; then
-    log "ERROR" "Failed to install pigz in Alpine container"
+  # Add a retry mechanism for pigz installation
+  local max_attempts=3
+  local attempt=1
+  local pigz_installed=false
+
+  while [ $attempt -le $max_attempts ] && [ "$pigz_installed" = false ]; do
+    log "INFO" "Checking for pigz installation (attempt $attempt of $max_attempts)..."
+
+    # Wait a moment for installation to complete
+    sleep 5
+
+    if docker exec "$ALPINE_CONTAINER_ID" sh -c "command -v pigz" >/dev/null 2>&1; then
+      pigz_installed=true
+      log "INFO" "Successfully verified pigz installation on attempt $attempt"
+    else
+      log "WARNING" "Pigz not found on attempt $attempt, waiting..."
+      attempt=$((attempt + 1))
+    fi
+  done
+
+  if [ "$pigz_installed" = false ]; then
+    log "ERROR" "Failed to install pigz in Alpine container after $max_attempts attempts"
     echo "ERROR: Failed to install pigz. Check network connectivity and Alpine package repositories."
 
     # Attempt to show more detailed error
