@@ -160,7 +160,7 @@ create_alpine_container() {
   ALPINE_CONTAINER_ID=$(docker run -d \
     --name "$container_name" \
     -v "$BACKUP_DIR:/backup" \
-    alpine sh -c "apk add --no-cache pigz && tail -f /dev/null")
+    alpine sh -c "apk update && apk add --no-cache pigz && echo 'PIGZ_INSTALLED=true' && tail -f /dev/null")
 
   if [ -z "$ALPINE_CONTAINER_ID" ] || ! docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
     log "ERROR" "Failed to create Alpine container for backup operations"
@@ -168,7 +168,21 @@ create_alpine_container() {
     return 1
   fi
 
+  # Verify that pigz was actually installed
+  if ! docker exec "$ALPINE_CONTAINER_ID" sh -c "command -v pigz" >/dev/null 2>&1; then
+    log "ERROR" "Failed to install pigz in Alpine container"
+    echo "ERROR: Failed to install pigz. Check network connectivity and Alpine package repositories."
+
+    # Attempt to show more detailed error
+    docker logs "$ALPINE_CONTAINER_ID" | tail -n 10
+
+    # Remove the failed container
+    docker rm -f "$ALPINE_CONTAINER_ID" >/dev/null 2>&1
+    return 1
+  fi
+
   log "INFO" "Alpine container created: $container_name ($ALPINE_CONTAINER_ID)"
+  log "INFO" "Verified pigz installation in container"
   return 0
 }
 
