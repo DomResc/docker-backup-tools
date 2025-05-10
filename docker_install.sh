@@ -180,31 +180,19 @@ if [ "$missing_scripts" = true ]; then
 fi
 
 # Install scripts
-echo -e "${COLOR_BLUE}Installing scripts...${COLOR_RESET}"
-
-for script in "${SCRIPT_NAMES[@]}"; do
-    cp "./$script" "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/$script"
-    echo -e "${COLOR_GREEN}Installed: $INSTALL_DIR/$script${COLOR_RESET}"
-done
-
-# Also install the install script itself
-cp "./docker_install.sh" "$INSTALL_DIR/"
-chmod +x "$INSTALL_DIR/docker_install.sh"
-echo -e "${COLOR_GREEN}Installed: $INSTALL_DIR/docker_install.sh${COLOR_RESET}"
-
-# Create symlinks without .sh extension
-echo -e "${COLOR_BLUE}Creating symlinks without .sh extension...${COLOR_RESET}"
+echo -e "${COLOR_BLUE}Installing scripts ...${COLOR_RESET}"
 
 for script in "${SCRIPT_NAMES[@]}"; do
     base_name=$(basename "$script" .sh)
-    ln -sf "$INSTALL_DIR/$script" "$INSTALL_DIR/$base_name"
-    echo -e "${COLOR_GREEN}Created symlink: $INSTALL_DIR/$base_name${COLOR_RESET}"
+    cp "./$script" "$INSTALL_DIR/$base_name"
+    chmod +x "$INSTALL_DIR/$base_name"
+    echo -e "${COLOR_GREEN}Installed: $INSTALL_DIR/$base_name${COLOR_RESET}"
 done
 
-# Create symlink for install script
-ln -sf "$INSTALL_DIR/docker_install.sh" "$INSTALL_DIR/docker_install"
-echo -e "${COLOR_GREEN}Created symlink: $INSTALL_DIR/docker_install${COLOR_RESET}"
+# Also install the install script itself
+cp "./docker_install.sh" "$INSTALL_DIR/docker_install"
+chmod +x "$INSTALL_DIR/docker_install"
+echo -e "${COLOR_GREEN}Installed: $INSTALL_DIR/docker_install${COLOR_RESET}"
 
 # Setup cron job for automated backups
 echo -e "${COLOR_BLUE}Setting up cron job for automated backups...${COLOR_RESET}"
@@ -249,9 +237,9 @@ if [ "$setup_cron" = "y" ]; then
     esac
 
     if [ ! -z "$cron_time" ]; then
-        # Create cron job
-        cron_line="$cron_time $INSTALL_DIR/docker_backup_full.sh --force >/dev/null 2>&1"
-        (crontab -l 2>/dev/null || echo "") | grep -v "docker_backup_full.sh" | {
+        # Create cron job with command
+        cron_line="$cron_time $INSTALL_DIR/docker_backup_full --force >/dev/null 2>&1"
+        (crontab -l 2>/dev/null || echo "") | grep -v "docker_backup_full" | {
             cat
             echo "$cron_line"
         } | crontab -

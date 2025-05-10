@@ -40,6 +40,7 @@ DOCKER_DIR="/var/lib/docker"
 LOG_DIR="/var/log/docker"
 LOG_FILE="${LOG_DIR}/backup.log"
 DOCKER_SERVICE="docker.service"
+DOCKER_SOCKET="docker.socket"
 CHECK_AFTER_BACKUP=true
 
 # Color definitions
@@ -327,23 +328,29 @@ check_disk_space() {
 
 # Manage Docker service (start/stop) with compatibility for different init systems
 manage_docker_service() {
-    local action="$1" # 'start' o 'stop'
+    local action="$1" # 'start' or 'stop'
 
-    # Verifica quale sistema init è in uso
+    # Verify which init system is in use
     if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
         # systemd
         log "INFO" "Using systemd to $action Docker"
-        systemctl $action $DOCKER_SERVICE
+        if [ "$action" = "stop" ]; then
+            systemctl $action $DOCKER_SOCKET
+            systemctl $action $DOCKER_SERVICE
+        else
+            systemctl $action $DOCKER_SERVICE
+            systemctl $action $DOCKER_SOCKET
+        fi
     elif command -v service >/dev/null 2>&1; then
-        # SysV init o upstart
+        # SysV init or upstart
         log "INFO" "Using service command to $action Docker"
         service docker $action
     elif [ -f /etc/init.d/docker ]; then
-        # SysV init script diretto
+        # SysV init script direct
         log "INFO" "Using init.d script to $action Docker"
         /etc/init.d/docker $action
     else
-        # Fallback a comandi diretti
+        # Fallback to direct commands
         if [ "$action" = "stop" ]; then
             log "INFO" "Using killall to stop Docker"
             killall -TERM dockerd
@@ -353,7 +360,7 @@ manage_docker_service() {
         fi
     fi
 
-    # Verifica lo stato dell'operazione
+    # Verify the operation status
     local max_wait=30
     local counter=0
     local expected_status=$([[ "$action" = "start" ]] && echo "running" || echo "stopped")
