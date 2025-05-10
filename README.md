@@ -52,7 +52,7 @@ The installation script will:
 ## Backup Usage
 
 ```bash
-docker_backup_full [OPTIONS]
+sudo docker_backup_full [OPTIONS]
 ```
 
 ### Backup Options
@@ -70,27 +70,27 @@ docker_backup_full [OPTIONS]
 
 ```bash
 # Basic backup with default settings
-docker_backup_full
+sudo docker_backup_full
 
 # Specify backup directory and higher compression
-docker_backup_full -d /mnt/backups/docker -c zstd
+sudo docker_backup_full -d /mnt/backups/docker -c zstd
 
 # Backup with forced Docker stopping (no confirmation prompts)
-docker_backup_full -f
+sudo docker_backup_full -f
 
 # Keep backups for 60 days
-docker_backup_full -r 60
+sudo docker_backup_full -r 60
 
 # Using environment variables
 export DOCKER_BACKUP_DIR=/mnt/storage/backups
 export DOCKER_COMPRESSION=zlib
-docker_backup_full
+sudo docker_backup_full
 ```
 
 ## Restore Usage
 
 ```bash
-docker_restore_full [OPTIONS] [ARCHIVE]
+sudo docker_restore_full [OPTIONS] [ARCHIVE]
 ```
 
 ### Restore Options
@@ -105,19 +105,19 @@ docker_restore_full [OPTIONS] [ARCHIVE]
 
 ```bash
 # Interactive restore (will show menu to select archive)
-docker_restore_full
+sudo docker_restore_full
 
 # Restore specific archive
-docker_restore_full docker-2025-05-10_14:30:45
+sudo docker_restore_full docker-2025-05-10_14:30:45
 
 # Force restore without confirmation prompts
-docker_restore_full -f docker-2025-05-10_14:30:45
+sudo docker_restore_full -f docker-2025-05-10_14:30:45
 ```
 
 ## Verify Usage
 
 ```bash
-docker_verify [OPTIONS] [ARCHIVE]
+sudo docker_verify [OPTIONS] [ARCHIVE]
 ```
 
 ### Verify Options
@@ -134,25 +134,25 @@ docker_verify [OPTIONS] [ARCHIVE]
 
 ```bash
 # Verify repository integrity
-docker_verify
+sudo docker_verify
 
 # List available archives
-docker_verify -l
+sudo docker_verify -l
 
 # Verify specific archive
-docker_verify docker-2025-05-10_14:30:45
+sudo docker_verify docker-2025-05-10_14:30:45
 
 # Verify all archives
-docker_verify -a
+sudo docker_verify -a
 
 # Quiet verification (output only on errors)
-docker_verify -q -a
+sudo docker_verify -q -a
 ```
 
 ## Cleanup Usage
 
 ```bash
-docker_cleanup [OPTIONS]
+sudo docker_cleanup [OPTIONS]
 ```
 
 ### Cleanup Options
@@ -178,25 +178,26 @@ docker_cleanup [OPTIONS]
 
 ```bash
 # Clean unused volumes and images
-docker_cleanup -v -i
+sudo docker_cleanup -v -i
 
 # Dry-run mode to see what would be removed
-docker_cleanup -a -d
+sudo docker_cleanup -a -d
 
 # Remove backups older than 90 days
-docker_cleanup -o 90
+sudo docker_cleanup -o 90
 
 # Clean all Docker resources
-docker_cleanup -a
+sudo docker_cleanup -a
 
 # Compact the Borg repository
-docker_cleanup -B
+sudo docker_cleanup -B
 ```
 
 ## Prerequisites
 
 - Linux system with Docker installed
 - Administrator privileges (to stop/start Docker)
+- **IMPORTANT**: All scripts MUST be run as root (or with sudo)
 - Borg Backup installed (installation script can install it automatically)
 - Sufficient disk space for backups
 

@@ -24,6 +24,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Check if script is run as root
+if [ "$(id -u)" -ne 0 ]; then
+  echo -e "\033[0;31mERROR: This script must be run as root\033[0m"
+  echo "Please run with sudo or as root user"
+  exit 1
+fi
+
 # Default configuration
 DEFAULT_BACKUP_DIR="/backup/docker"
 DOCKER_DIR="/var/lib/docker"
@@ -164,7 +171,7 @@ check_borg_installation() {
         read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
         if [ "$run_install" == "y" ]; then
           log "INFO" "Running installation script"
-          sudo "$install_script"
+          "$install_script"
 
           # Verifica se l'installazione ha avuto successo
           if ! command_exists borg; then
@@ -187,7 +194,7 @@ check_borg_installation() {
         read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
         if [ "$run_install" == "y" ]; then
           log "INFO" "Running installation script"
-          sudo "$repo_install_script"
+          "$repo_install_script"
 
           # Verifica se l'installazione ha avuto successo
           if ! command_exists borg; then
@@ -336,23 +343,23 @@ manage_docker_service() {
   if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
     # systemd
     log "INFO" "Using systemd to $action Docker"
-    sudo systemctl $action $DOCKER_SERVICE
+    systemctl $action $DOCKER_SERVICE
   elif command -v service >/dev/null 2>&1; then
     # SysV init o upstart
     log "INFO" "Using service command to $action Docker"
-    sudo service docker $action
+    service docker $action
   elif [ -f /etc/init.d/docker ]; then
     # SysV init script diretto
     log "INFO" "Using init.d script to $action Docker"
-    sudo /etc/init.d/docker $action
+    /etc/init.d/docker $action
   else
     # Fallback a comandi diretti
     if [ "$action" = "stop" ]; then
       log "INFO" "Using killall to stop Docker"
-      sudo killall -TERM dockerd
+      killall -TERM dockerd
     else
       log "INFO" "Starting Docker daemon directly"
-      sudo dockerd &
+      dockerd &
     fi
   fi
 
@@ -465,18 +472,18 @@ backup_docker_dir() {
 
   echo -e "${COLOR_CYAN}${COLOR_BOLD}Backing up current Docker directory...${COLOR_RESET}"
 
-  if ! sudo mv "$DOCKER_DIR" "$backup_dir"; then
+  if ! mv "$DOCKER_DIR" "$backup_dir"; then
     log "ERROR" "Failed to backup Docker directory"
     echo -e "${COLOR_RED}ERROR: Failed to backup Docker directory${COLOR_RESET}"
     exit 1
   fi
 
   # Create an empty Docker directory
-  if ! sudo mkdir -p "$DOCKER_DIR"; then
+  if ! mkdir -p "$DOCKER_DIR"; then
     log "ERROR" "Failed to create new Docker directory"
     echo -e "${COLOR_RED}ERROR: Failed to create new Docker directory${COLOR_RESET}"
     # Try to restore the original directory
-    sudo mv "$backup_dir" "$DOCKER_DIR"
+    mv "$backup_dir" "$DOCKER_DIR"
     exit 1
   fi
 
@@ -491,19 +498,19 @@ set_docker_permissions() {
   log "INFO" "Setting proper permissions on Docker directory"
 
   # Imposta proprietà di base
-  sudo chown -R root:root "$DOCKER_DIR"
+  chown -R root:root "$DOCKER_DIR"
 
   # Imposta permessi specifici per sottodirectory Docker
   if [ -d "$DOCKER_DIR/volumes" ]; then
-    sudo chmod 711 "$DOCKER_DIR/volumes"
+    chmod 711 "$DOCKER_DIR/volumes"
     # Imposta permessi ricorsivi per le sottodirectory dei volumi
-    find "$DOCKER_DIR/volumes" -type d -exec sudo chmod 755 {} \;
+    find "$DOCKER_DIR/volumes" -type d -exec chmod 755 {} \;
   fi
 
   # Imposta permessi per i file di configurazione
   if [ -d "$DOCKER_DIR/containers" ]; then
-    sudo chmod 710 "$DOCKER_DIR/containers"
-    find "$DOCKER_DIR/containers" -type f -name "*.json" -exec sudo chmod 640 {} \;
+    chmod 710 "$DOCKER_DIR/containers"
+    find "$DOCKER_DIR/containers" -type f -name "*.json" -exec chmod 640 {} \;
   fi
 
   log "INFO" "Docker permissions set successfully"
@@ -538,7 +545,7 @@ restore_archive() {
 
   # Cambia directory alla radice e limita l'estrazione a /var/lib/docker
   cd /
-  if ! sudo borg extract --progress "$BACKUP_DIR::$archive" var/lib/docker; then
+  if ! borg extract --progress "$BACKUP_DIR::$archive" var/lib/docker; then
     log "ERROR" "Failed to extract archive"
     echo -e "${COLOR_RED}ERROR: Failed to extract archive${COLOR_RESET}"
     start_docker

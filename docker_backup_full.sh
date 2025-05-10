@@ -24,6 +24,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Check if script is run as root
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "\033[0;31mERROR: This script must be run as root\033[0m"
+    echo "Please run with sudo or as root user"
+    exit 1
+fi
+
 # Default configuration
 # These can be overridden by environment variables or command line arguments
 DEFAULT_BACKUP_DIR="/backup/docker"
@@ -187,7 +194,7 @@ check_borg_installation() {
                 read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
                 if [ "$run_install" == "y" ]; then
                     log "INFO" "Running installation script"
-                    sudo "$install_script"
+                    "$install_script"
 
                     # Verifica se l'installazione ha avuto successo
                     if ! command_exists borg; then
@@ -210,7 +217,7 @@ check_borg_installation() {
                 read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
                 if [ "$run_install" == "y" ]; then
                     log "INFO" "Running installation script"
-                    sudo "$repo_install_script"
+                    "$repo_install_script"
 
                     # Verifica se l'installazione ha avuto successo
                     if ! command_exists borg; then
@@ -326,23 +333,23 @@ manage_docker_service() {
     if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
         # systemd
         log "INFO" "Using systemd to $action Docker"
-        sudo systemctl $action $DOCKER_SERVICE
+        systemctl $action $DOCKER_SERVICE
     elif command -v service >/dev/null 2>&1; then
         # SysV init o upstart
         log "INFO" "Using service command to $action Docker"
-        sudo service docker $action
+        service docker $action
     elif [ -f /etc/init.d/docker ]; then
         # SysV init script diretto
         log "INFO" "Using init.d script to $action Docker"
-        sudo /etc/init.d/docker $action
+        /etc/init.d/docker $action
     else
         # Fallback a comandi diretti
         if [ "$action" = "stop" ]; then
             log "INFO" "Using killall to stop Docker"
-            sudo killall -TERM dockerd
+            killall -TERM dockerd
         else
             log "INFO" "Starting Docker daemon directly"
-            sudo dockerd &
+            dockerd &
         fi
     fi
 

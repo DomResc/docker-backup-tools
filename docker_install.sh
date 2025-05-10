@@ -274,14 +274,14 @@ if command -v borg &>/dev/null; then
                 echo -e "${COLOR_GREEN}Repository initialized successfully!${COLOR_RESET}"
             else
                 echo -e "${COLOR_RED}Failed to initialize repository.${COLOR_RESET}"
-                echo -e "${COLOR_YELLOW}You can initialize it later with: borg init --encryption=none $BACKUP_DIR${COLOR_RESET}"
+                echo -e "${COLOR_YELLOW}You can initialize it later with: sudo borg init --encryption=none $BACKUP_DIR${COLOR_RESET}"
             fi
         else
             echo -e "${COLOR_GREEN}Repository already exists at $BACKUP_DIR.${COLOR_RESET}"
         fi
     else
         echo -e "${COLOR_BLUE}Skipping repository initialization.${COLOR_RESET}"
-        echo -e "${COLOR_YELLOW}You can initialize it later with: borg init --encryption=none $BACKUP_DIR${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}You can initialize it later with: sudo borg init --encryption=none $BACKUP_DIR${COLOR_RESET}"
     fi
 fi
 
@@ -302,7 +302,10 @@ echo ""
 echo -e "${COLOR_BLUE}Backup directory:${COLOR_RESET} $BACKUP_DIR"
 echo -e "${COLOR_BLUE}Log directory:${COLOR_RESET} $LOG_DIR"
 echo ""
-echo -e "${COLOR_YELLOW}Try running 'docker_backup_full' to create your first backup!${COLOR_RESET}"
-echo -e "${COLOR_YELLOW}If you need to reinstall or update, run 'docker_install'.${COLOR_RESET}"
+echo -e "${COLOR_YELLOW}Important: All scripts must be run with root privileges.${COLOR_RESET}"
+echo -e "${COLOR_YELLOW}For example: sudo docker_backup_full${COLOR_RESET}"
+echo ""
+echo -e "${COLOR_YELLOW}Try running 'sudo docker_backup_full' to create your first backup!${COLOR_RESET}"
+echo -e "${COLOR_YELLOW}If you need to reinstall or update, run 'sudo docker_install'.${COLOR_RESET}"
 
 exit 0

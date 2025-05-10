@@ -24,6 +24,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Check if script is run as root
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "\033[0;31mERROR: This script must be run as root\033[0m"
+    echo "Please run with sudo or as root user"
+    exit 1
+fi
+
 # Default configuration
 DEFAULT_BACKUP_DIR="/backup/docker"
 LOG_DIR="/var/log/docker"
@@ -238,7 +245,7 @@ check_borg_installation() {
                     read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
                     if [ "$run_install" == "y" ]; then
                         log "INFO" "Running installation script"
-                        sudo "$install_script"
+                        "$install_script"
 
                         # Verifica se l'installazione ha avuto successo
                         if ! command_exists borg; then
@@ -261,7 +268,7 @@ check_borg_installation() {
                     read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
                     if [ "$run_install" == "y" ]; then
                         log "INFO" "Running installation script"
-                        sudo "$repo_install_script"
+                        "$repo_install_script"
 
                         # Verifica se l'installazione ha avuto successo
                         if ! command_exists borg; then
