@@ -4,7 +4,7 @@
 #
 # MIT License
 #
-# Copyright (c) 2025 Your Name
+# Copyright (c) 2025 Domenico Rescigno
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -112,7 +112,7 @@ ensure_log_directory() {
       exit 1
     fi
   fi
-  
+
   if [ ! -f "$LOG_FILE" ]; then
     touch "$LOG_FILE"
     if [ $? -ne 0 ]; then
@@ -128,34 +128,34 @@ log() {
   local message="$2"
   local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
   local color=""
-  
+
   # Skip non-error messages in quiet mode
   if [ "$QUIET_MODE" = true ] && [ "$level" != "ERROR" ]; then
     # Still log to file
-    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    echo "[$timestamp] [$level] $message" >>"$LOG_FILE"
     return
   fi
-  
+
   case "$level" in
-    "INFO")
-      color=$COLOR_GREEN
-      ;;
-    "WARNING")
-      color=$COLOR_YELLOW
-      ;;
-    "ERROR")
-      color=$COLOR_RED
-      ;;
-    *)
-      color=$COLOR_RESET
-      ;;
+  "INFO")
+    color=$COLOR_GREEN
+    ;;
+  "WARNING")
+    color=$COLOR_YELLOW
+    ;;
+  "ERROR")
+    color=$COLOR_RED
+    ;;
+  *)
+    color=$COLOR_RESET
+    ;;
   esac
-  
+
   # Log to console with colors
   echo -e "[$timestamp] [${color}${level}${COLOR_RESET}] $message"
-  
+
   # Log to file without colors
-  echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+  echo "[$timestamp] [$level] $message" >>"$LOG_FILE"
 }
 
 # Check if a command is available
@@ -178,13 +178,13 @@ check_borg_installation() {
     echo -e "For other systems, see: ${COLOR_BLUE}https://borgbackup.org/install.html${COLOR_RESET}"
     exit 1
   fi
-  
+
   log "INFO" "Borg Backup is installed"
-  
+
   # Check borg version
   local borg_version=$(borg --version | cut -d' ' -f2)
   log "INFO" "Borg version: $borg_version"
-  
+
   return 0
 }
 
@@ -195,14 +195,14 @@ check_repository() {
     echo -e "${COLOR_RED}ERROR: Backup directory $BACKUP_DIR does not exist${COLOR_RESET}"
     exit 1
   fi
-  
+
   # Check if it's a valid borg repository
   if ! borg info "$BACKUP_DIR" >/dev/null 2>&1; then
     log "ERROR" "Directory $BACKUP_DIR is not a valid Borg repository"
     echo -e "${COLOR_RED}ERROR: Directory $BACKUP_DIR is not a valid Borg repository${COLOR_RESET}"
     exit 1
   fi
-  
+
   log "INFO" "Valid Borg repository found at $BACKUP_DIR"
 }
 
@@ -214,31 +214,31 @@ get_archives() {
 # List archives with details
 list_archives() {
   log "INFO" "Listing available archives"
-  
+
   echo -e "${COLOR_CYAN}${COLOR_BOLD}Available backup archives:${COLOR_RESET}"
   echo -e "${COLOR_CYAN}------------------------------------------------------${COLOR_RESET}"
-  
+
   # Get list of archives
   local archives=($(get_archives))
-  
+
   if [ ${#archives[@]} -eq 0 ]; then
     log "ERROR" "No archives found in repository"
     echo -e "${COLOR_RED}No archives found in repository $BACKUP_DIR${COLOR_RESET}"
     exit 1
   fi
-  
+
   # Print archives with details
   for archive in "${archives[@]}"; do
     local info=$(borg info --json "$BACKUP_DIR::$archive" 2>/dev/null)
     local date=$(echo "$info" | grep -o '"time": "[^"]*"' | cut -d'"' -f4 | cut -d'.' -f1 | sed 's/T/ /')
     local size=$(echo "$info" | grep -o '"original_size": [0-9]*' | cut -d' ' -f2)
     local compressed_size=$(echo "$info" | grep -o '"compressed_size": [0-9]*' | cut -d' ' -f2)
-    
+
     # Convert sizes to human-readable format
-    if [ "$size" -ge $((1024*1024*1024)) ]; then
+    if [ "$size" -ge $((1024 * 1024 * 1024)) ]; then
       size=$(echo "scale=2; $size/1024/1024/1024" | bc)
       size="${size}G"
-    elif [ "$size" -ge $((1024*1024)) ]; then
+    elif [ "$size" -ge $((1024 * 1024)) ]; then
       size=$(echo "scale=2; $size/1024/1024" | bc)
       size="${size}M"
     elif [ "$size" -ge 1024 ]; then
@@ -247,11 +247,11 @@ list_archives() {
     else
       size="${size}B"
     fi
-    
-    if [ "$compressed_size" -ge $((1024*1024*1024)) ]; then
+
+    if [ "$compressed_size" -ge $((1024 * 1024 * 1024)) ]; then
       compressed_size=$(echo "scale=2; $compressed_size/1024/1024/1024" | bc)
       compressed_size="${compressed_size}G"
-    elif [ "$compressed_size" -ge $((1024*1024)) ]; then
+    elif [ "$compressed_size" -ge $((1024 * 1024)) ]; then
       compressed_size=$(echo "scale=2; $compressed_size/1024/1024" | bc)
       compressed_size="${compressed_size}M"
     elif [ "$compressed_size" -ge 1024 ]; then
@@ -260,12 +260,12 @@ list_archives() {
     else
       compressed_size="${compressed_size}B"
     fi
-    
+
     echo -e "  ${COLOR_YELLOW}*${COLOR_RESET} ${COLOR_GREEN}$archive${COLOR_RESET}"
     echo -e "    ${COLOR_BLUE}Created:${COLOR_RESET} $date"
     echo -e "    ${COLOR_BLUE}Size:${COLOR_RESET} $size (Compressed: $compressed_size)"
   done
-  
+
   echo ""
   log "INFO" "Total archives: ${#archives[@]}"
 }
@@ -274,13 +274,13 @@ list_archives() {
 verify_repository() {
   log "INFO" "Verifying repository integrity"
   echo -e "${COLOR_CYAN}${COLOR_BOLD}Verifying repository integrity...${COLOR_RESET}"
-  
+
   local start_time=$(date +%s)
   borg check --repository-only --progress "$BACKUP_DIR"
   local check_result=$?
   local end_time=$(date +%s)
   local duration=$((end_time - start_time))
-  
+
   if [ $check_result -eq 0 ]; then
     log "INFO" "Repository integrity check completed successfully in $duration seconds"
     echo -e "${COLOR_GREEN}${COLOR_BOLD}Repository integrity check passed!${COLOR_RESET}"
@@ -297,20 +297,20 @@ verify_archive() {
   local archive="$1"
   log "INFO" "Verifying archive $archive"
   echo -e "${COLOR_CYAN}${COLOR_BOLD}Verifying archive: $archive${COLOR_RESET}"
-  
+
   # Verify the archive exists
   if ! borg info "$BACKUP_DIR::$archive" >/dev/null 2>&1; then
     log "ERROR" "Archive $archive not found in repository"
     echo -e "${COLOR_RED}ERROR: Archive $archive not found in repository${COLOR_RESET}"
     return 1
-  }
-  
+  fi
+
   local start_time=$(date +%s)
   borg check --progress "$BACKUP_DIR::$archive"
   local check_result=$?
   local end_time=$(date +%s)
   local duration=$((end_time - start_time))
-  
+
   if [ $check_result -eq 0 ]; then
     log "INFO" "Archive $archive verified successfully in $duration seconds"
     echo -e "${COLOR_GREEN}${COLOR_BOLD}Archive $archive integrity check passed!${COLOR_RESET}"
@@ -326,32 +326,32 @@ verify_archive() {
 verify_all_archives() {
   log "INFO" "Verifying all archives"
   echo -e "${COLOR_CYAN}${COLOR_BOLD}Verifying all archives in repository...${COLOR_RESET}"
-  
+
   # Get list of archives
   local archives=($(get_archives))
-  
+
   if [ ${#archives[@]} -eq 0 ]; then
     log "ERROR" "No archives found in repository"
     echo -e "${COLOR_RED}No archives found in repository $BACKUP_DIR${COLOR_RESET}"
     return 1
   fi
-  
+
   local total=${#archives[@]}
   local passed=0
   local failed=0
   local failed_archives=()
-  
+
   # Verify each archive
   local i=1
   for archive in "${archives[@]}"; do
     echo -e "\n${COLOR_CYAN}${COLOR_BOLD}[$i/$total] Verifying archive: $archive${COLOR_RESET}"
-    
+
     local start_time=$(date +%s)
     borg check --progress "$BACKUP_DIR::$archive"
     local check_result=$?
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
-    
+
     if [ $check_result -eq 0 ]; then
       log "INFO" "Archive $archive verified successfully in $duration seconds"
       echo -e "${COLOR_GREEN}Archive $archive integrity check passed!${COLOR_RESET}"
@@ -362,10 +362,10 @@ verify_all_archives() {
       failed=$((failed + 1))
       failed_archives+=("$archive")
     fi
-    
+
     i=$((i + 1))
   done
-  
+
   # Show summary
   echo -e "\n${COLOR_CYAN}${COLOR_BOLD}Verification Summary:${COLOR_RESET}"
   echo -e "${COLOR_CYAN}------------------------------------------------------${COLOR_RESET}"
@@ -373,7 +373,7 @@ verify_all_archives() {
   echo -e "${COLOR_BLUE}Total archives:${COLOR_RESET} $total"
   echo -e "${COLOR_GREEN}Passed:${COLOR_RESET} $passed"
   echo -e "${COLOR_RED}Failed:${COLOR_RESET} $failed"
-  
+
   if [ $failed -gt 0 ]; then
     echo -e "\n${COLOR_RED}${COLOR_BOLD}Failed archives:${COLOR_RESET}"
     for archive in "${failed_archives[@]}"; do
@@ -381,7 +381,7 @@ verify_all_archives() {
     done
     return 1
   fi
-  
+
   return 0
 }
 
@@ -397,19 +397,19 @@ display_header() {
 # Main function
 main() {
   display_header
-  
+
   log "INFO" "Starting Docker backup verification process"
-  
+
   # Check prerequisites
   check_borg_installation
   check_repository
-  
+
   # If list only, just show archives and exit
   if [ "$LIST_ONLY" = true ]; then
     list_archives
     exit 0
   fi
-  
+
   # Determine what to verify
   if [ ! -z "$ARCHIVE_ARG" ]; then
     # Verify specific archive
@@ -424,7 +424,7 @@ main() {
     verify_repository
     exit $?
   fi
-  
+
   return 0
 }
 

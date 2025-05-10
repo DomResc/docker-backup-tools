@@ -4,7 +4,7 @@
 #
 # MIT License
 #
-# Copyright (c) 2025 Your Name
+# Copyright (c) 2025 Domenico Rescigno
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -105,7 +105,7 @@ ensure_log_directory() {
       exit 1
     fi
   fi
-  
+
   if [ ! -f "$LOG_FILE" ]; then
     touch "$LOG_FILE"
     if [ $? -ne 0 ]; then
@@ -121,27 +121,27 @@ log() {
   local message="$2"
   local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
   local color=""
-  
+
   case "$level" in
-    "INFO")
-      color=$COLOR_GREEN
-      ;;
-    "WARNING")
-      color=$COLOR_YELLOW
-      ;;
-    "ERROR")
-      color=$COLOR_RED
-      ;;
-    *)
-      color=$COLOR_RESET
-      ;;
+  "INFO")
+    color=$COLOR_GREEN
+    ;;
+  "WARNING")
+    color=$COLOR_YELLOW
+    ;;
+  "ERROR")
+    color=$COLOR_RED
+    ;;
+  *)
+    color=$COLOR_RESET
+    ;;
   esac
-  
+
   # Log to console with colors
   echo -e "[$timestamp] [${color}${level}${COLOR_RESET}] $message"
-  
+
   # Log to file without colors
-  echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+  echo "[$timestamp] [$level] $message" >>"$LOG_FILE"
 }
 
 # Check if a command is available
@@ -164,13 +164,13 @@ check_borg_installation() {
     echo -e "For other systems, see: ${COLOR_BLUE}https://borgbackup.org/install.html${COLOR_RESET}"
     exit 1
   fi
-  
+
   log "INFO" "Borg Backup is installed"
-  
+
   # Check borg version
   local borg_version=$(borg --version | cut -d' ' -f2)
   log "INFO" "Borg version: $borg_version"
-  
+
   return 0
 }
 
@@ -181,45 +181,45 @@ check_repository() {
     echo -e "${COLOR_RED}ERROR: Backup directory $BACKUP_DIR does not exist${COLOR_RESET}"
     exit 1
   fi
-  
+
   # Check if it's a valid borg repository
   if ! borg info "$BACKUP_DIR" >/dev/null 2>&1; then
     log "ERROR" "Directory $BACKUP_DIR is not a valid Borg repository"
     echo -e "${COLOR_RED}ERROR: Directory $BACKUP_DIR is not a valid Borg repository${COLOR_RESET}"
     exit 1
   fi
-  
+
   log "INFO" "Valid Borg repository found at $BACKUP_DIR"
 }
 
 # Show list of available archives
 show_archives() {
   log "INFO" "Listing available archives"
-  
+
   echo -e "${COLOR_CYAN}${COLOR_BOLD}Available backup archives:${COLOR_RESET}"
   echo -e "${COLOR_CYAN}------------------------------------------------------${COLOR_RESET}"
-  
+
   # Get list of archives with creation date
   local archives=($(borg list --short "$BACKUP_DIR"))
-  
+
   if [ ${#archives[@]} -eq 0 ]; then
     log "ERROR" "No archives found in repository"
     echo -e "${COLOR_RED}No archives found in repository $BACKUP_DIR${COLOR_RESET}"
     exit 1
   fi
-  
+
   # Print archives with numbers
   local i=1
   for archive in "${archives[@]}"; do
     local info=$(borg info --json "$BACKUP_DIR::$archive" 2>/dev/null)
     local date=$(echo "$info" | grep -o '"time": "[^"]*"' | cut -d'"' -f4 | cut -d'.' -f1 | sed 's/T/ /')
     local size=$(echo "$info" | grep -o '"original_size": [0-9]*' | cut -d' ' -f2)
-    
+
     # Convert size to human-readable format
-    if [ "$size" -ge $((1024*1024*1024)) ]; then
+    if [ "$size" -ge $((1024 * 1024 * 1024)) ]; then
       size=$(echo "scale=2; $size/1024/1024/1024" | bc)
       size="${size}G"
-    elif [ "$size" -ge $((1024*1024)) ]; then
+    elif [ "$size" -ge $((1024 * 1024)) ]; then
       size=$(echo "scale=2; $size/1024/1024" | bc)
       size="${size}M"
     elif [ "$size" -ge 1024 ]; then
@@ -228,13 +228,13 @@ show_archives() {
     else
       size="${size}B"
     fi
-    
+
     echo -e "  ${COLOR_YELLOW}$i)${COLOR_RESET} $archive ${COLOR_CYAN}(Created: $date, Size: $size)${COLOR_RESET}"
-    i=$((i+1))
+    i=$((i + 1))
   done
-  
+
   echo ""
-  
+
   # Return the array of archive names
   echo "${archives[@]}"
 }
@@ -242,13 +242,13 @@ show_archives() {
 # Stop Docker service
 stop_docker() {
   log "INFO" "Stopping Docker service"
-  
+
   # Check if Docker is running
   if ! systemctl is-active --quiet $DOCKER_SERVICE; then
     log "INFO" "Docker service is already stopped"
     return 0
   fi
-  
+
   if [ "$FORCE" != "true" ]; then
     echo -e "${COLOR_YELLOW}WARNING: This will stop all Docker containers and the Docker service.${COLOR_RESET}"
     read -p "$(echo -e "${COLOR_YELLOW}Are you sure you want to continue? (y/n): ${COLOR_RESET}")" confirm
@@ -257,10 +257,10 @@ stop_docker() {
       exit 0
     fi
   fi
-  
+
   log "INFO" "Stopping Docker service now"
   sudo systemctl stop $DOCKER_SERVICE
-  
+
   # Wait for Docker to stop
   local max_wait=30
   local counter=0
@@ -273,7 +273,7 @@ stop_docker() {
       exit 1
     fi
   done
-  
+
   DOCKER_STOPPED=true
   log "INFO" "Docker service stopped successfully"
 }
@@ -283,7 +283,7 @@ start_docker() {
   if [ "$DOCKER_STOPPED" = true ]; then
     log "INFO" "Starting Docker service"
     sudo systemctl start $DOCKER_SERVICE
-    
+
     # Wait for Docker to start
     local max_wait=60
     local counter=0
@@ -297,22 +297,22 @@ start_docker() {
         return 1
       fi
     done
-    
+
     log "INFO" "Docker service started successfully"
   else
     log "INFO" "Docker was not stopped, no need to start it"
   fi
-  
+
   return 0
 }
 
 # Function to ensure Docker is restarted on script exit or error
 cleanup_on_exit() {
   log "INFO" "Running cleanup on exit"
-  
+
   # Make sure Docker is running
   start_docker
-  
+
   log "INFO" "Cleanup completed"
 }
 
@@ -322,24 +322,24 @@ backup_docker_dir() {
     log "WARNING" "Docker directory $DOCKER_DIR does not exist, nothing to backup"
     return 0
   fi
-  
+
   local backup_dir="${DOCKER_DIR}.bak.$(date +%Y%m%d%H%M%S)"
   log "INFO" "Creating backup of current Docker directory to $backup_dir"
-  
+
   if [ -d "$backup_dir" ]; then
     log "ERROR" "Backup directory $backup_dir already exists"
     echo -e "${COLOR_RED}ERROR: Backup directory $backup_dir already exists${COLOR_RESET}"
     exit 1
   fi
-  
+
   echo -e "${COLOR_CYAN}${COLOR_BOLD}Backing up current Docker directory...${COLOR_RESET}"
-  
+
   if ! sudo mv "$DOCKER_DIR" "$backup_dir"; then
     log "ERROR" "Failed to backup Docker directory"
     echo -e "${COLOR_RED}ERROR: Failed to backup Docker directory${COLOR_RESET}"
     exit 1
   fi
-  
+
   # Create an empty Docker directory
   if ! sudo mkdir -p "$DOCKER_DIR"; then
     log "ERROR" "Failed to create new Docker directory"
@@ -348,10 +348,10 @@ backup_docker_dir() {
     sudo mv "$backup_dir" "$DOCKER_DIR"
     exit 1
   fi
-  
+
   log "INFO" "Current Docker directory backed up successfully to $backup_dir"
   echo -e "${COLOR_GREEN}Current Docker directory backed up to: $backup_dir${COLOR_RESET}"
-  
+
   return 0
 }
 
@@ -359,48 +359,48 @@ backup_docker_dir() {
 restore_archive() {
   local archive="$1"
   local start_time=$(date +%s)
-  
+
   log "INFO" "Starting restoration of archive $archive"
-  
+
   # Verify the archive exists
   if ! borg info "$BACKUP_DIR::$archive" >/dev/null 2>&1; then
     log "ERROR" "Archive $archive not found in repository"
     echo -e "${COLOR_RED}ERROR: Archive $archive not found in repository${COLOR_RESET}"
     exit 1
-  }
-  
+  fi
+
   # Stop Docker service
   stop_docker
-  
+
   # Backup current Docker directory
   backup_docker_dir
-  
+
   # Extract the archive
   log "INFO" "Extracting archive $archive to $DOCKER_DIR"
   echo -e "${COLOR_CYAN}${COLOR_BOLD}Extracting backup archive... This may take some time.${COLOR_RESET}"
-  
+
   if ! sudo borg extract --progress "$BACKUP_DIR::$archive"; then
     log "ERROR" "Failed to extract archive"
     echo -e "${COLOR_RED}ERROR: Failed to extract archive${COLOR_RESET}"
     start_docker
     exit 1
   fi
-  
+
   local end_time=$(date +%s)
   local duration=$((end_time - start_time))
-  
+
   log "INFO" "Archive extracted successfully in $duration seconds"
-  
+
   # Set proper permissions on Docker directory
   log "INFO" "Setting proper permissions on Docker directory"
   sudo chown -R root:root "$DOCKER_DIR"
-  
+
   # Start Docker service
   start_docker
-  
+
   log "INFO" "Restore operation completed successfully"
   echo -e "${COLOR_GREEN}${COLOR_BOLD}Restore completed successfully!${COLOR_RESET}"
-  
+
   return 0
 }
 
@@ -416,16 +416,16 @@ display_header() {
 # Main function
 main() {
   display_header
-  
+
   log "INFO" "Starting Docker full restore process"
-  
+
   # Check prerequisites
   check_borg_installation
   check_repository
-  
+
   # Determine which archive to restore
   local archive_to_restore=""
-  
+
   if [ ! -z "$ARCHIVE_ARG" ]; then
     # Archive specified as argument
     archive_to_restore="$ARCHIVE_ARG"
@@ -433,26 +433,26 @@ main() {
   else
     # Show menu of available archives
     read -ra ARCHIVES <<<$(show_archives)
-    
+
     # Ask user to select an archive
     read -p "$(echo -e "${COLOR_YELLOW}Select archive to restore (1-${#ARCHIVES[@]}, 0 to exit): ${COLOR_RESET}")" choice
-    
+
     if [ "$choice" -eq 0 ]; then
       log "INFO" "Restore canceled by user"
       echo -e "${COLOR_GREEN}Restore canceled.${COLOR_RESET}"
       exit 0
     fi
-    
+
     if [ "$choice" -lt 1 ] || [ "$choice" -gt "${#ARCHIVES[@]}" ]; then
       log "ERROR" "Invalid selection: $choice"
       echo -e "${COLOR_RED}ERROR: Invalid selection${COLOR_RESET}"
       exit 1
     fi
-    
+
     archive_to_restore="${ARCHIVES[$((choice - 1))]}"
     log "INFO" "Selected archive: $archive_to_restore"
   fi
-  
+
   # Confirm restoration
   if [ "$FORCE" != "true" ]; then
     echo -e "${COLOR_YELLOW}${COLOR_BOLD}WARNING: This will replace your entire Docker installation!${COLOR_RESET}"
@@ -464,10 +464,10 @@ main() {
       exit 0
     fi
   fi
-  
+
   # Perform the restoration
   restore_archive "$archive_to_restore"
-  
+
   return 0
 }
 
