@@ -1,10 +1,10 @@
 #!/bin/bash
-# Docker Cleanup - A utility to clean unused Docker resources
+# Docker Volume Tools - A utility to clean Docker resources and Borg backups
 # https://github.com/domresc/docker-volume-tools
 #
 # MIT License
 #
-# Copyright (c) 2025 Domenico Rescigno
+# Copyright (c) 2025 Your Name
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -25,669 +25,810 @@
 # SOFTWARE.
 
 # Default configuration
-DEFAULT_LOG_DIR="/backup/docker"
-LOG_FILE="${DEFAULT_LOG_DIR}/docker_cleanup.log"
+DEFAULT_BACKUP_DIR="/backup/docker"
+LOG_DIR="/var/log/docker"
+LOG_FILE="${LOG_DIR}/cleanup.log"
 
-# Global container ID for the Alpine container used for cleanup operations
-ALPINE_CONTAINER_ID=""
+# Color definitions
+COLOR_RESET="\033[0m"
+COLOR_RED="\033[0;31m"
+COLOR_GREEN="\033[0;32m"
+COLOR_YELLOW="\033[0;33m"
+COLOR_BLUE="\033[0;34m"
+COLOR_MAGENTA="\033[0;35m"
+COLOR_CYAN="\033[0;36m"
+COLOR_WHITE="\033[0;37m"
+COLOR_BOLD="\033[1m"
 
 # Parse command line arguments
 usage() {
-  echo "Usage: $0 [OPTIONS]"
-  echo "Clean up unused Docker resources"
-  echo ""
-  echo "Options:"
-  echo "  -v, --volumes          Clean unused volumes"
-  echo "  -i, --images           Clean dangling images"
-  echo "  -c, --containers       Remove stopped containers"
-  echo "  -n, --networks         Remove unused networks"
-  echo "  -b, --builder          Clean up builder cache"
-  echo "  -t, --temp             Clean temporary restore volumes"
-  echo "  -a, --all              Clean all of the above"
-  echo "  -x, --prune-all        Run Docker system prune with all options (CAUTION: removes ALL unused objects)"
-  echo "  -d, --dry-run          Show what would be removed without actually removing"
-  echo "  -f, --force            Don't ask for confirmation"
-  echo "  -l, --log-dir DIR      Custom log directory (default: ${DEFAULT_LOG_DIR})"
-  echo "  -h, --help             Display this help message"
-  exit 1
+    echo -e "${COLOR_CYAN}Usage: $0 [OPTIONS]${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}Clean up Docker resources and Borg backups${COLOR_RESET}"
+    echo ""
+    echo -e "${COLOR_CYAN}Options:${COLOR_RESET}"
+    echo -e "  ${COLOR_GREEN}-v, --volumes${COLOR_RESET}         Clean unused volumes"
+    echo -e "  ${COLOR_GREEN}-i, --images${COLOR_RESET}          Clean dangling images"
+    echo -e "  ${COLOR_GREEN}-c, --containers${COLOR_RESET}      Remove stopped containers"
+    echo -e "  ${COLOR_GREEN}-n, --networks${COLOR_RESET}        Remove unused networks"
+    echo -e "  ${COLOR_GREEN}-b, --builder${COLOR_RESET}         Clean up builder cache"
+    echo -e "  ${COLOR_GREEN}-B, --borg${COLOR_RESET}            Clean and compact Borg repository"
+    echo -e "  ${COLOR_GREEN}-o, --old-backups DAYS${COLOR_RESET} Remove backups older than DAYS days"
+    echo -e "  ${COLOR_GREEN}-a, --all${COLOR_RESET}             Clean all Docker resources (not Borg)"
+    echo -e "  ${COLOR_GREEN}-A, --all-borg${COLOR_RESET}        Clean all Borg backups (DANGER: removes ALL backups)"
+    echo -e "  ${COLOR_GREEN}-x, --prune-all${COLOR_RESET}       Run Docker system prune with all options"
+    echo -e "  ${COLOR_GREEN}-d, --dry-run${COLOR_RESET}         Show what would be removed without actually removing"
+    echo -e "  ${COLOR_GREEN}-f, --force${COLOR_RESET}           Don't ask for confirmation"
+    echo -e "  ${COLOR_GREEN}-l, --backup-dir DIR${COLOR_RESET}  Custom backup directory (default: $DEFAULT_BACKUP_DIR)"
+    echo -e "  ${COLOR_GREEN}-h, --help${COLOR_RESET}            Display this help message"
+    echo ""
+    echo -e "${COLOR_CYAN}Environment variables:${COLOR_RESET}"
+    echo -e "  ${COLOR_GREEN}DOCKER_BACKUP_DIR${COLOR_RESET}     Same as --backup-dir"
+    exit 1
 }
 
-# Initialize flags
+# Initialize options
 CLEAN_VOLUMES=false
 CLEAN_IMAGES=false
 CLEAN_CONTAINERS=false
 CLEAN_NETWORKS=false
 CLEAN_BUILDER=false
-CLEAN_TEMP_VOLUMES=false
+CLEAN_BORG=false
 CLEAN_ALL=false
+CLEAN_ALL_BORG=false
 PRUNE_ALL=false
 DRY_RUN=false
 FORCE=false
-LOG_DIR=$DEFAULT_LOG_DIR
+BACKUP_DIR=${DOCKER_BACKUP_DIR:-$DEFAULT_BACKUP_DIR}
+OLD_BACKUPS_DAYS=0
 
 # Parse command line options
 while [[ $# -gt 0 ]]; do
-  case $1 in
-  -v | --volumes)
-    CLEAN_VOLUMES=true
-    shift
-    ;;
-  -i | --images)
-    CLEAN_IMAGES=true
-    shift
-    ;;
-  -c | --containers)
-    CLEAN_CONTAINERS=true
-    shift
-    ;;
-  -n | --networks)
-    CLEAN_NETWORKS=true
-    shift
-    ;;
-  -b | --builder)
-    CLEAN_BUILDER=true
-    shift
-    ;;
-  -t | --temp)
-    CLEAN_TEMP_VOLUMES=true
-    shift
-    ;;
-  -a | --all)
-    CLEAN_ALL=true
-    shift
-    ;;
-  -x | --prune-all)
-    PRUNE_ALL=true
-    shift
-    ;;
-  -d | --dry-run)
-    DRY_RUN=true
-    shift
-    ;;
-  -f | --force)
-    FORCE=true
-    shift
-    ;;
-  -l | --log-dir)
-    LOG_DIR="$2"
-    LOG_FILE="${LOG_DIR}/docker_cleanup.log"
-    shift 2
-    ;;
-  -h | --help)
-    usage
-    ;;
-  *)
-    echo "Unknown option: $1"
-    usage
-    ;;
-  esac
+    case $1 in
+    -v | --volumes)
+        CLEAN_VOLUMES=true
+        shift
+        ;;
+    -i | --images)
+        CLEAN_IMAGES=true
+        shift
+        ;;
+    -c | --containers)
+        CLEAN_CONTAINERS=true
+        shift
+        ;;
+    -n | --networks)
+        CLEAN_NETWORKS=true
+        shift
+        ;;
+    -b | --builder)
+        CLEAN_BUILDER=true
+        shift
+        ;;
+    -B | --borg)
+        CLEAN_BORG=true
+        shift
+        ;;
+    -o | --old-backups)
+        if [[ "$2" =~ ^[0-9]+$ ]]; then
+            OLD_BACKUPS_DAYS="$2"
+            shift 2
+        else
+            echo -e "${COLOR_RED}ERROR: --old-backups requires a number of days${COLOR_RESET}"
+            exit 1
+        fi
+        ;;
+    -a | --all)
+        CLEAN_ALL=true
+        shift
+        ;;
+    -A | --all-borg)
+        CLEAN_ALL_BORG=true
+        shift
+        ;;
+    -x | --prune-all)
+        PRUNE_ALL=true
+        shift
+        ;;
+    -d | --dry-run)
+        DRY_RUN=true
+        shift
+        ;;
+    -f | --force)
+        FORCE=true
+        shift
+        ;;
+    -l | --backup-dir)
+        BACKUP_DIR="$2"
+        shift 2
+        ;;
+    -h | --help)
+        usage
+        ;;
+    *)
+        echo -e "${COLOR_RED}Unknown option: $1${COLOR_RESET}"
+        usage
+        ;;
+    esac
 done
 
-# Set up logging
-if [ ! -d "$LOG_DIR" ]; then
-  mkdir -p "$LOG_DIR"
-fi
+# Setup logging
+ensure_log_directory() {
+    if [ ! -d "$LOG_DIR" ]; then
+        mkdir -p "$LOG_DIR"
+        if [ $? -ne 0 ]; then
+            echo -e "${COLOR_RED}ERROR: Failed to create log directory $LOG_DIR${COLOR_RESET}"
+            echo -e "${COLOR_YELLOW}Run the following commands to create the directory with correct permissions:${COLOR_RESET}"
+            echo -e "${COLOR_CYAN}sudo mkdir -p $LOG_DIR${COLOR_RESET}"
+            echo -e "${COLOR_CYAN}sudo chown $USER:$USER $LOG_DIR${COLOR_RESET}"
+            exit 1
+        fi
+    fi
 
-if [ ! -f "$LOG_FILE" ]; then
-  touch "$LOG_FILE"
-fi
+    if [ ! -f "$LOG_FILE" ]; then
+        touch "$LOG_FILE"
+        if [ $? -ne 0 ]; then
+            echo -e "${COLOR_RED}ERROR: Failed to create log file $LOG_FILE${COLOR_RESET}"
+            exit 1
+        fi
+    fi
+}
 
 # Logging function
 log() {
-  local level="$1"
-  local message="$2"
-  local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-  echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+    local level="$1"
+    local message="$2"
+    local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+    local color=""
+
+    case "$level" in
+    "INFO")
+        color=$COLOR_GREEN
+        ;;
+    "WARNING")
+        color=$COLOR_YELLOW
+        ;;
+    "ERROR")
+        color=$COLOR_RED
+        ;;
+    *)
+        color=$COLOR_RESET
+        ;;
+    esac
+
+    # Log to console with colors
+    echo -e "[$timestamp] [${color}${level}${COLOR_RESET}] $message"
+
+    # Log to file without colors
+    echo "[$timestamp] [$level] $message" >>"$LOG_FILE"
 }
 
-# Function to create and prepare Alpine container (if needed for volume operations)
-create_alpine_container() {
-  log "INFO" "Creating Alpine container for cleanup helper operations..."
-
-  # Create a unique name for the container based on date and a random string
-  local container_name="docker_volume_cleanup_$(date +%Y%m%d%H%M%S)_$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 6 | head -n 1)"
-
-  # Create a long-running container with useful tools installed
-  ALPINE_CONTAINER_ID=$(docker run -d \
-    --name "$container_name" \
-    alpine sh -c "apk add --no-cache coreutils findutils && tail -f /dev/null")
-
-  if [ -z "$ALPINE_CONTAINER_ID" ] || ! docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
-    log "ERROR" "Failed to create Alpine container for cleanup operations"
-    echo "ERROR: Failed to create Alpine container"
-    return 1
-  fi
-
-  log "INFO" "Alpine container created: $container_name ($ALPINE_CONTAINER_ID)"
-  return 0
+# Check if a command is available
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
 }
-
-# Function to remove Alpine container
-remove_alpine_container() {
-  if [ -n "$ALPINE_CONTAINER_ID" ] && docker ps -q --filter "id=$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
-    log "INFO" "Removing Alpine container..."
-    if ! docker rm -f "$ALPINE_CONTAINER_ID" >/dev/null 2>&1; then
-      log "WARNING" "Failed to remove Alpine container $ALPINE_CONTAINER_ID"
-    else
-      log "INFO" "Alpine container removed successfully"
-    fi
-  fi
-}
-
-# Function to ensure the Alpine container is removed on script exit or error
-cleanup_on_exit() {
-  log "INFO" "Running cleanup on exit..."
-  remove_alpine_container
-  log "INFO" "Cleanup completed"
-}
-
-# Register trap for cleanup
-trap cleanup_on_exit EXIT INT TERM
-
-# If no options provided, show usage
-if [ "$CLEAN_VOLUMES" = false ] && [ "$CLEAN_IMAGES" = false ] && [ "$CLEAN_CONTAINERS" = false ] && [ "$CLEAN_NETWORKS" = false ] && [ "$CLEAN_BUILDER" = false ] && [ "$CLEAN_TEMP_VOLUMES" = false ] && [ "$CLEAN_ALL" = false ] && [ "$PRUNE_ALL" = false ]; then
-  echo "No cleanup options specified."
-  usage
-fi
-
-# If all is selected, set all options to true
-if [ "$CLEAN_ALL" = true ]; then
-  CLEAN_VOLUMES=true
-  CLEAN_IMAGES=true
-  CLEAN_CONTAINERS=true
-  CLEAN_NETWORKS=true
-  CLEAN_BUILDER=true
-  CLEAN_TEMP_VOLUMES=true
-fi
 
 # Verify Docker access
-verify_permissions() {
-  # Check if the user can execute docker commands
-  if ! docker ps >/dev/null 2>&1; then
-    log "ERROR" "Current user cannot execute Docker commands."
-    echo "ERROR: Current user cannot execute Docker commands."
-    echo "Make sure you are in the 'docker' group or are root:"
-    echo "sudo usermod -aG docker $USER"
-    echo "After adding to the group, restart your session (logout/login)."
-    exit 1
-  fi
+verify_docker_access() {
+    # Check if the user can execute docker commands
+    if ! docker ps >/dev/null 2>&1; then
+        log "ERROR" "Current user cannot execute Docker commands."
+        echo -e "${COLOR_RED}ERROR: Current user cannot execute Docker commands.${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}Make sure you are in the 'docker' group or are root:${COLOR_RESET}"
+        echo -e "${COLOR_CYAN}sudo usermod -aG docker $USER${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}After adding to the group, restart your session (logout/login).${COLOR_RESET}"
+        exit 1
+    fi
 
-  log "INFO" "Docker access verified."
+    log "INFO" "Docker access verified."
+}
+
+# Check if Borg is installed
+check_borg_installation() {
+    if [ "$CLEAN_BORG" = true ] || [ "$CLEAN_ALL_BORG" = true ] || [ "$OLD_BACKUPS_DAYS" -gt 0 ]; then
+        if ! command_exists borg; then
+            log "ERROR" "Borg Backup is not installed"
+            echo -e "${COLOR_RED}ERROR: Borg Backup is required for Borg-related operations${COLOR_RESET}"
+            exit 1
+        fi
+
+        # Check if it's a valid borg repository
+        if ! borg info "$BACKUP_DIR" >/dev/null 2>&1; then
+            log "ERROR" "Directory $BACKUP_DIR is not a valid Borg repository"
+            echo -e "${COLOR_RED}ERROR: Directory $BACKUP_DIR is not a valid Borg repository${COLOR_RESET}"
+            exit 1
+        fi
+
+        log "INFO" "Borg Backup is installed and repository is valid"
+    fi
 }
 
 # Helper function to ask for confirmation
 confirm_action() {
-  local message="$1"
+    local message="$1"
 
-  if [ "$FORCE" = true ]; then
-    return 0
-  fi
+    if [ "$FORCE" = true ]; then
+        return 0
+    fi
 
-  read -p "$message (y/n): " confirm
-  if [ "$confirm" = "y" ]; then
-    return 0
-  else
-    return 1
-  fi
+    read -p "$(echo -e "${COLOR_YELLOW}$message (y/n): ${COLOR_RESET}")" confirm
+    if [ "$confirm" = "y" ]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 # Clean unused volumes
 clean_volumes() {
-  log "INFO" "Checking for unused volumes..."
+    log "INFO" "Checking for unused volumes..."
 
-  # Get list of all volumes
-  local all_volumes=$(docker volume ls -q)
-  local unused_volumes=()
+    # Get list of all volumes
+    local all_volumes=$(docker volume ls -q)
+    local unused_volumes=()
 
-  if [ -z "$all_volumes" ]; then
-    log "INFO" "No Docker volumes found."
-    return 0
-  fi
-
-  # Find unused volumes
-  for volume in $all_volumes; do
-    # Skip if the volume is used by any container
-    local used_by=$(docker ps -a --filter volume=$volume -q)
-    if [ -z "$used_by" ]; then
-      unused_volumes+=("$volume")
-    fi
-  done
-
-  if [ ${#unused_volumes[@]} -eq 0 ]; then
-    log "INFO" "No unused volumes found."
-    echo "No unused volumes to remove."
-    return 0
-  fi
-
-  echo "Found ${#unused_volumes[@]} unused volumes:"
-  for volume in "${unused_volumes[@]}"; do
-    echo "  - $volume"
-  done
-
-  # Exit here if dry run
-  if [ "$DRY_RUN" = true ]; then
-    log "INFO" "Dry run: would have removed ${#unused_volumes[@]} volumes"
-    return 0
-  fi
-
-  # Ask for confirmation
-  if ! confirm_action "Remove ${#unused_volumes[@]} unused volumes?"; then
-    log "INFO" "Volume cleanup canceled by user"
-    echo "Volume cleanup canceled."
-    return 0
-  fi
-
-  # Remove unused volumes
-  local removed=0
-  local failed=0
-
-  for volume in "${unused_volumes[@]}"; do
-    log "INFO" "Removing unused volume: $volume"
-    if docker volume rm "$volume" >/dev/null 2>&1; then
-      log "INFO" "Volume $volume removed successfully"
-      removed=$((removed + 1))
-    else
-      log "ERROR" "Failed to remove volume $volume"
-      failed=$((failed + 1))
-    fi
-  done
-
-  log "INFO" "Volume cleanup completed. Removed: $removed, Failed: $failed"
-  echo "Volume cleanup completed. Removed: $removed, Failed: $failed"
-}
-
-# Clean temporary restore volumes
-clean_temp_volumes() {
-  log "INFO" "Checking for temporary restore volumes..."
-
-  # Get list of temporary restore volumes
-  local temp_volumes=$(docker volume ls -q | grep "^temp_restore_")
-
-  if [ -z "$temp_volumes" ]; then
-    log "INFO" "No temporary restore volumes found."
-    echo "No temporary restore volumes to remove."
-    return 0
-  fi
-
-  local temp_volume_count=$(echo "$temp_volumes" | wc -l)
-  echo "Found $temp_volume_count temporary restore volume(s):"
-  echo "$temp_volumes"
-
-  # Exit here if dry run
-  if [ "$DRY_RUN" = true ]; then
-    log "INFO" "Dry run: would have removed $temp_volume_count temporary volumes"
-    return 0
-  fi
-
-  # Ask for confirmation
-  if ! confirm_action "Remove $temp_volume_count temporary volumes?"; then
-    log "INFO" "Temporary volume cleanup canceled by user"
-    echo "Temporary volume cleanup canceled."
-    return 0
-  fi
-
-  # Create Alpine container if needed for volume inspection
-  if [ "$DRY_RUN" != true ]; then
-    create_alpine_container
-  fi
-
-  # Remove temporary volumes
-  local removed=0
-  local failed=0
-
-  for volume in $temp_volumes; do
-    # Display volume information if available
-    if [ -n "$ALPINE_CONTAINER_ID" ]; then
-      # Mount volume to container and check contents
-      local file_count=$(docker run --rm -v "$volume:/vol_to_check" alpine sh -c "find /vol_to_check -type f | wc -l")
-      local size=$(docker run --rm -v "$volume:/vol_to_check" alpine sh -c "du -sh /vol_to_check | cut -f1")
-      log "INFO" "Temporary volume: $volume, Size: $size, Files: $file_count"
-      echo "  - $volume (Size: $size, Files: $file_count)"
+    if [ -z "$all_volumes" ]; then
+        log "INFO" "No Docker volumes found."
+        return 0
     fi
 
-    log "INFO" "Removing temporary volume: $volume"
-    if docker volume rm "$volume" >/dev/null 2>&1; then
-      log "INFO" "Temporary volume $volume removed successfully"
-      removed=$((removed + 1))
-    else
-      log "ERROR" "Failed to remove temporary volume $volume"
-      failed=$((failed + 1))
-    fi
-  done
+    # Find unused volumes
+    for volume in $all_volumes; do
+        # Skip if the volume is used by any container
+        local used_by=$(docker ps -a --filter volume=$volume -q)
+        if [ -z "$used_by" ]; then
+            unused_volumes+=("$volume")
+        fi
+    done
 
-  log "INFO" "Temporary volume cleanup completed. Removed: $removed, Failed: $failed"
-  echo "Temporary volume cleanup completed. Removed: $removed, Failed: $failed"
+    if [ ${#unused_volumes[@]} -eq 0 ]; then
+        log "INFO" "No unused volumes found."
+        echo -e "${COLOR_GREEN}No unused volumes to remove.${COLOR_RESET}"
+        return 0
+    fi
+
+    echo -e "${COLOR_CYAN}Found ${#unused_volumes[@]} unused volumes:${COLOR_RESET}"
+    for volume in "${unused_volumes[@]}"; do
+        echo -e "  ${COLOR_YELLOW}*${COLOR_RESET} $volume"
+    done
+
+    # Exit here if dry run
+    if [ "$DRY_RUN" = true ]; then
+        log "INFO" "Dry run: would have removed ${#unused_volumes[@]} volumes"
+        return 0
+    fi
+
+    # Ask for confirmation
+    if ! confirm_action "Remove ${#unused_volumes[@]} unused volumes?"; then
+        log "INFO" "Volume cleanup canceled by user"
+        echo -e "${COLOR_GREEN}Volume cleanup canceled.${COLOR_RESET}"
+        return 0
+    fi
+
+    # Remove unused volumes
+    local removed=0
+    local failed=0
+
+    for volume in "${unused_volumes[@]}"; do
+        log "INFO" "Removing unused volume: $volume"
+        if docker volume rm "$volume" >/dev/null 2>&1; then
+            log "INFO" "Volume $volume removed successfully"
+            removed=$((removed + 1))
+        else
+            log "ERROR" "Failed to remove volume $volume"
+            failed=$((failed + 1))
+        fi
+    done
+
+    log "INFO" "Volume cleanup completed. Removed: $removed, Failed: $failed"
+    echo -e "${COLOR_GREEN}Volume cleanup completed. Removed: $removed, Failed: $failed${COLOR_RESET}"
 }
 
 # Clean dangling images
 clean_images() {
-  log "INFO" "Checking for dangling images..."
+    log "INFO" "Checking for dangling images..."
 
-  # Get list of dangling images
-  local dangling_images=$(docker images -f "dangling=true" -q)
+    # Get list of dangling images
+    local dangling_images=$(docker images -f "dangling=true" -q)
 
-  if [ -z "$dangling_images" ]; then
-    log "INFO" "No dangling images found."
-    echo "No dangling images to remove."
-    return 0
-  fi
+    if [ -z "$dangling_images" ]; then
+        log "INFO" "No dangling images found."
+        echo -e "${COLOR_GREEN}No dangling images to remove.${COLOR_RESET}"
+        return 0
+    fi
 
-  local image_count=$(echo "$dangling_images" | wc -l)
-  echo "Found $image_count dangling image(s)"
+    local image_count=$(echo "$dangling_images" | wc -l)
+    echo -e "${COLOR_CYAN}Found $image_count dangling image(s)${COLOR_RESET}"
 
-  # Exit here if dry run
-  if [ "$DRY_RUN" = true ]; then
-    log "INFO" "Dry run: would have removed $image_count dangling images"
-    return 0
-  fi
+    # Exit here if dry run
+    if [ "$DRY_RUN" = true ]; then
+        log "INFO" "Dry run: would have removed $image_count dangling images"
+        return 0
+    fi
 
-  # Ask for confirmation
-  if ! confirm_action "Remove $image_count dangling images?"; then
-    log "INFO" "Image cleanup canceled by user"
-    echo "Image cleanup canceled."
-    return 0
-  fi
+    # Ask for confirmation
+    if ! confirm_action "Remove $image_count dangling images?"; then
+        log "INFO" "Image cleanup canceled by user"
+        echo -e "${COLOR_GREEN}Image cleanup canceled.${COLOR_RESET}"
+        return 0
+    fi
 
-  # Remove dangling images
-  log "INFO" "Removing dangling images..."
-  if docker rmi $dangling_images >/dev/null 2>&1; then
-    log "INFO" "Successfully removed $image_count dangling images"
-    echo "Successfully removed $image_count dangling images"
-  else
-    log "WARNING" "Some dangling images could not be removed"
-    echo "Some dangling images could not be removed"
-  fi
+    # Remove dangling images
+    log "INFO" "Removing dangling images..."
+    if docker rmi $dangling_images >/dev/null 2>&1; then
+        log "INFO" "Successfully removed $image_count dangling images"
+        echo -e "${COLOR_GREEN}Successfully removed $image_count dangling images${COLOR_RESET}"
+    else
+        log "WARNING" "Some dangling images could not be removed"
+        echo -e "${COLOR_YELLOW}Some dangling images could not be removed${COLOR_RESET}"
+    fi
 }
 
 # Clean stopped containers
 clean_containers() {
-  log "INFO" "Checking for stopped containers..."
+    log "INFO" "Checking for stopped containers..."
 
-  # Get list of stopped containers
-  local stopped_containers=$(docker ps -a -f "status=exited" -q)
+    # Get list of stopped containers
+    local stopped_containers=$(docker ps -a -f "status=exited" -q)
 
-  if [ -z "$stopped_containers" ]; then
-    log "INFO" "No stopped containers found."
-    echo "No stopped containers to remove."
-    return 0
-  fi
-
-  local container_count=$(echo "$stopped_containers" | wc -l)
-  echo "Found $container_count stopped container(s)"
-
-  # Show more details about the containers
-  if [ "$container_count" -gt 0 ]; then
-    echo "Details of stopped containers:"
-    docker ps -a -f "status=exited" --format "  - {{.Names}} (ID: {{.ID}}, Image: {{.Image}}, Exited: {{.Status}})"
-  fi
-
-  # Exit here if dry run
-  if [ "$DRY_RUN" = true ]; then
-    log "INFO" "Dry run: would have removed $container_count stopped containers"
-    return 0
-  fi
-
-  # Ask for confirmation
-  if ! confirm_action "Remove $container_count stopped containers?"; then
-    log "INFO" "Container cleanup canceled by user"
-    echo "Container cleanup canceled."
-    return 0
-  fi
-
-  # Remove stopped containers
-  log "INFO" "Removing stopped containers..."
-  if docker rm $stopped_containers >/dev/null 2>&1; then
-    log "INFO" "Successfully removed $container_count stopped containers"
-    echo "Successfully removed $container_count stopped containers"
-  else
-    log "WARNING" "Some stopped containers could not be removed"
-    echo "Some stopped containers could not be removed"
-
-    # Try to show which ones failed
-    local remaining=$(docker ps -a -f "status=exited" -q)
-    if [ -n "$remaining" ]; then
-      local remaining_count=$(echo "$remaining" | wc -l)
-      echo "Containers that could not be removed ($remaining_count):"
-      docker ps -a -f "status=exited" --format "  - {{.Names}} (ID: {{.ID}}, Image: {{.Image}})"
+    if [ -z "$stopped_containers" ]; then
+        log "INFO" "No stopped containers found."
+        echo -e "${COLOR_GREEN}No stopped containers to remove.${COLOR_RESET}"
+        return 0
     fi
-  fi
+
+    local container_count=$(echo "$stopped_containers" | wc -l)
+    echo -e "${COLOR_CYAN}Found $container_count stopped container(s)${COLOR_RESET}"
+
+    # Show more details about the containers
+    if [ "$container_count" -gt 0 ]; then
+        echo -e "${COLOR_CYAN}Details of stopped containers:${COLOR_RESET}"
+        docker ps -a -f "status=exited" --format "  ${COLOR_YELLOW}*${COLOR_RESET} {{.Names}} (ID: {{.ID}}, Image: {{.Image}}, Exited: {{.Status}})"
+    fi
+
+    # Exit here if dry run
+    if [ "$DRY_RUN" = true ]; then
+        log "INFO" "Dry run: would have removed $container_count stopped containers"
+        return 0
+    fi
+
+    # Ask for confirmation
+    if ! confirm_action "Remove $container_count stopped containers?"; then
+        log "INFO" "Container cleanup canceled by user"
+        echo -e "${COLOR_GREEN}Container cleanup canceled.${COLOR_RESET}"
+        return 0
+    fi
+
+    # Remove stopped containers
+    log "INFO" "Removing stopped containers..."
+    if docker rm $stopped_containers >/dev/null 2>&1; then
+        log "INFO" "Successfully removed $container_count stopped containers"
+        echo -e "${COLOR_GREEN}Successfully removed $container_count stopped containers${COLOR_RESET}"
+    else
+        log "WARNING" "Some stopped containers could not be removed"
+        echo -e "${COLOR_YELLOW}Some stopped containers could not be removed${COLOR_RESET}"
+    fi
 }
 
 # Clean unused networks
 clean_networks() {
-  log "INFO" "Checking for unused networks..."
+    log "INFO" "Checking for unused networks..."
 
-  # Get list of custom networks
-  local all_networks=$(docker network ls --filter "type=custom" -q)
+    # Get list of custom networks
+    local all_networks=$(docker network ls --filter "type=custom" -q)
 
-  if [ -z "$all_networks" ]; then
-    log "INFO" "No custom networks found."
-    echo "No custom networks to check."
-    return 0
-  fi
-
-  # Find unused networks
-  local unused_networks=()
-
-  for network in $all_networks; do
-    # Check if network is used by any container
-    local containers=$(docker network inspect --format='{{range .Containers}}{{.Name}} {{end}}' "$network" | awk '{$1=$1};1')
-    if [ -z "$containers" ]; then
-      local name=$(docker network inspect --format='{{.Name}}' "$network")
-      unused_networks+=("$network:$name")
+    if [ -z "$all_networks" ]; then
+        log "INFO" "No custom networks found."
+        echo -e "${COLOR_GREEN}No custom networks to check.${COLOR_RESET}"
+        return 0
     fi
-  done
 
-  if [ ${#unused_networks[@]} -eq 0 ]; then
-    log "INFO" "No unused networks found."
-    echo "No unused networks to remove."
-    return 0
-  fi
+    # Find unused networks
+    local unused_networks=()
 
-  echo "Found ${#unused_networks[@]} unused network(s):"
-  for network_info in "${unused_networks[@]}"; do
-    local id=$(echo "$network_info" | cut -d':' -f1)
-    local name=$(echo "$network_info" | cut -d':' -f2)
-    echo "  - $name ($id)"
-  done
+    for network in $all_networks; do
+        # Check if network is used by any container
+        local containers=$(docker network inspect --format='{{range .Containers}}{{.Name}} {{end}}' "$network" | awk '{$1=$1};1')
+        if [ -z "$containers" ]; then
+            local name=$(docker network inspect --format='{{.Name}}' "$network")
+            unused_networks+=("$network:$name")
+        fi
+    done
 
-  # Exit here if dry run
-  if [ "$DRY_RUN" = true ]; then
-    log "INFO" "Dry run: would have removed ${#unused_networks[@]} networks"
-    return 0
-  fi
-
-  # Ask for confirmation
-  if ! confirm_action "Remove ${#unused_networks[@]} unused networks?"; then
-    log "INFO" "Network cleanup canceled by user"
-    echo "Network cleanup canceled."
-    return 0
-  fi
-
-  # Remove unused networks
-  local removed=0
-  local failed=0
-
-  for network_info in "${unused_networks[@]}"; do
-    local id=$(echo "$network_info" | cut -d':' -f1)
-    local name=$(echo "$network_info" | cut -d':' -f2)
-
-    log "INFO" "Removing unused network: $name"
-    local error_output
-    if error_output=$(docker network rm "$id" 2>&1); then
-      log "INFO" "Network $name removed successfully"
-      removed=$((removed + 1))
-    else
-      log "ERROR" "Failed to remove network $name: $error_output"
-      echo "Failed to remove network $name: $error_output"
-      failed=$((failed + 1))
-      if echo "$error_output" | grep -q "has active endpoints"; then
-        log "WARNING" "Network $name has active endpoints or dependencies that prevent removal"
-        echo "WARNING: Network $name has active endpoints or dependencies that prevent removal"
-      fi
+    if [ ${#unused_networks[@]} -eq 0 ]; then
+        log "INFO" "No unused networks found."
+        echo -e "${COLOR_GREEN}No unused networks to remove.${COLOR_RESET}"
+        return 0
     fi
-  done
 
-  log "INFO" "Network cleanup completed. Removed: $removed, Failed: $failed"
-  echo "Network cleanup completed. Removed: $removed, Failed: $failed"
+    echo -e "${COLOR_CYAN}Found ${#unused_networks[@]} unused network(s):${COLOR_RESET}"
+    for network_info in "${unused_networks[@]}"; do
+        local id=$(echo "$network_info" | cut -d':' -f1)
+        local name=$(echo "$network_info" | cut -d':' -f2)
+        echo -e "  ${COLOR_YELLOW}*${COLOR_RESET} $name ($id)"
+    done
+
+    # Exit here if dry run
+    if [ "$DRY_RUN" = true ]; then
+        log "INFO" "Dry run: would have removed ${#unused_networks[@]} networks"
+        return 0
+    fi
+
+    # Ask for confirmation
+    if ! confirm_action "Remove ${#unused_networks[@]} unused networks?"; then
+        log "INFO" "Network cleanup canceled by user"
+        echo -e "${COLOR_GREEN}Network cleanup canceled.${COLOR_RESET}"
+        return 0
+    fi
+
+    # Remove unused networks
+    local removed=0
+    local failed=0
+
+    for network_info in "${unused_networks[@]}"; do
+        local id=$(echo "$network_info" | cut -d':' -f1)
+        local name=$(echo "$network_info" | cut -d':' -f2)
+
+        log "INFO" "Removing unused network: $name"
+        if docker network rm "$id" >/dev/null 2>&1; then
+            log "INFO" "Network $name removed successfully"
+            removed=$((removed + 1))
+        else
+            log "ERROR" "Failed to remove network $name"
+            failed=$((failed + 1))
+        fi
+    done
+
+    log "INFO" "Network cleanup completed. Removed: $removed, Failed: $failed"
+    echo -e "${COLOR_GREEN}Network cleanup completed. Removed: $removed, Failed: $failed${COLOR_RESET}"
 }
 
 # Clean builder cache
 clean_builder() {
-  log "INFO" "Cleaning Docker builder cache..."
+    log "INFO" "Cleaning Docker builder cache..."
 
-  # Exit here if dry run
-  if [ "$DRY_RUN" = true ]; then
-    log "INFO" "Dry run: would have cleaned builder cache"
-    echo "Dry run: would have cleaned builder cache"
+    # Exit here if dry run
+    if [ "$DRY_RUN" = true ]; then
+        log "INFO" "Dry run: would have cleaned builder cache"
+        echo -e "${COLOR_GREEN}Dry run: would have cleaned builder cache${COLOR_RESET}"
+        return 0
+    fi
+
+    # Ask for confirmation
+    if ! confirm_action "Clean Docker builder cache?"; then
+        log "INFO" "Builder cache cleanup canceled by user"
+        echo -e "${COLOR_GREEN}Builder cache cleanup canceled.${COLOR_RESET}"
+        return 0
+    fi
+
+    # Clean builder cache
+    if docker builder prune -f >/dev/null 2>&1; then
+        log "INFO" "Successfully cleaned builder cache"
+        echo -e "${COLOR_GREEN}Successfully cleaned builder cache${COLOR_RESET}"
+    else
+        log "ERROR" "Failed to clean builder cache"
+        echo -e "${COLOR_RED}Failed to clean builder cache${COLOR_RESET}"
+    fi
+}
+
+# Clean and compact Borg repository
+clean_borg() {
+    log "INFO" "Cleaning and compacting Borg repository..."
+    echo -e "${COLOR_CYAN}Cleaning and compacting Borg repository at $BACKUP_DIR...${COLOR_RESET}"
+
+    # Exit here if dry run
+    if [ "$DRY_RUN" = true ]; then
+        log "INFO" "Dry run: would have compacted Borg repository"
+        echo -e "${COLOR_GREEN}Dry run: would have compacted Borg repository${COLOR_RESET}"
+        return 0
+    fi
+
+    # Ask for confirmation
+    if ! confirm_action "Compact Borg repository? This can take a long time for large repositories."; then
+        log "INFO" "Borg compaction canceled by user"
+        echo -e "${COLOR_GREEN}Borg compaction canceled.${COLOR_RESET}"
+        return 0
+    fi
+
+    # First prune any locks that might exist
+    log "INFO" "Checking for stale locks..."
+    borg break-lock "$BACKUP_DIR" 2>/dev/null
+
+    # Compact the repository
+    log "INFO" "Compacting repository (this may take a while)..."
+    echo -e "${COLOR_CYAN}${COLOR_BOLD}Compacting repository... This may take a long time for large repositories.${COLOR_RESET}"
+
+    if borg compact --progress "$BACKUP_DIR"; then
+        log "INFO" "Repository compaction completed successfully"
+        echo -e "${COLOR_GREEN}Repository compaction completed successfully${COLOR_RESET}"
+    else
+        log "ERROR" "Repository compaction failed"
+        echo -e "${COLOR_RED}Repository compaction failed${COLOR_RESET}"
+        return 1
+    fi
+
     return 0
-  fi
+}
 
-  # Ask for confirmation
-  if ! confirm_action "Clean Docker builder cache?"; then
-    log "INFO" "Builder cache cleanup canceled by user"
-    echo "Builder cache cleanup canceled."
+# Clean old Borg backups
+clean_old_backups() {
+    local days="$1"
+    log "INFO" "Removing backups older than $days days..."
+    echo -e "${COLOR_CYAN}Removing backups older than $days days...${COLOR_RESET}"
+
+    # Exit here if dry run
+    if [ "$DRY_RUN" = true ]; then
+        log "INFO" "Dry run: would have pruned backups older than $days days"
+        borg prune --dry-run --keep-within ${days}d --list "$BACKUP_DIR"
+        return 0
+    fi
+
+    # Ask for confirmation
+    if ! confirm_action "Remove backups older than $days days?"; then
+        log "INFO" "Backup pruning canceled by user"
+        echo -e "${COLOR_GREEN}Backup pruning canceled.${COLOR_RESET}"
+        return 0
+    fi
+
+    # Prune old backups
+    if borg prune --stats --progress --keep-within ${days}d "$BACKUP_DIR"; then
+        log "INFO" "Successfully pruned backups older than $days days"
+        echo -e "${COLOR_GREEN}Successfully pruned backups older than $days days${COLOR_RESET}"
+    else
+        log "ERROR" "Failed to prune old backups"
+        echo -e "${COLOR_RED}Failed to prune old backups${COLOR_RESET}"
+        return 1
+    fi
+
     return 0
-  fi
+}
 
-  # Clean builder cache
-  if docker builder prune -f >/dev/null 2>&1; then
-    log "INFO" "Successfully cleaned builder cache"
-    echo "Successfully cleaned builder cache"
-  else
-    log "ERROR" "Failed to clean builder cache"
-    echo "Failed to clean builder cache"
-  fi
+# Clean all Borg backups
+clean_all_borg() {
+    log "INFO" "Preparing to remove ALL Borg backups..."
+    echo -e "${COLOR_RED}${COLOR_BOLD}WARNING: This will remove ALL backups in the repository!${COLOR_RESET}"
+
+    # Exit here if dry run
+    if [ "$DRY_RUN" = true ]; then
+        log "INFO" "Dry run: would have removed ALL Borg backups"
+        echo -e "${COLOR_GREEN}Dry run: would have removed ALL Borg backups${COLOR_RESET}"
+        return 0
+    fi
+
+    # Ask for extra confirmation for this dangerous operation
+    echo -e "${COLOR_RED}${COLOR_BOLD}DANGER: This operation will delete ALL backups and CANNOT be undone!${COLOR_RESET}"
+    if ! confirm_action "Are you ABSOLUTELY SURE you want to delete ALL backups? Type 'yes' to confirm"; then
+        log "INFO" "Complete backup deletion canceled by user"
+        echo -e "${COLOR_GREEN}Complete backup deletion canceled.${COLOR_RESET}"
+        return 0
+    fi
+
+    # Double-check with an extra confirmation
+    if ! confirm_action "Last chance! Are you really sure you want to delete ALL Docker backups?"; then
+        log "INFO" "Complete backup deletion canceled by user"
+        echo -e "${COLOR_GREEN}Complete backup deletion canceled.${COLOR_RESET}"
+        return 0
+    fi
+
+    # Remove all backups
+    log "INFO" "Removing ALL Borg backups..."
+
+    # First remove all the archives
+    if borg prune --stats --progress --keep-within 0d "$BACKUP_DIR"; then
+        log "INFO" "Successfully removed all backup archives"
+
+        # Then compact the repository
+        if borg compact --progress "$BACKUP_DIR"; then
+            log "INFO" "Repository compaction completed successfully"
+            echo -e "${COLOR_GREEN}All backups removed and repository compacted successfully${COLOR_RESET}"
+        else
+            log "ERROR" "Repository compaction failed after removing all backups"
+            echo -e "${COLOR_YELLOW}All backups removed but repository compaction failed${COLOR_RESET}"
+        fi
+    else
+        log "ERROR" "Failed to remove all backups"
+        echo -e "${COLOR_RED}Failed to remove all backups${COLOR_RESET}"
+        return 1
+    fi
+
+    return 0
 }
 
 # Run Docker system prune
 run_system_prune() {
-  log "INFO" "Running Docker system prune (all)..."
+    log "INFO" "Running Docker system prune (all)..."
 
-  # Exit here if dry run
-  if [ "$DRY_RUN" = true ]; then
-    log "INFO" "Dry run: would have run system prune with all options"
-    echo "Dry run: would have run system prune with all options"
-    return 0
-  fi
+    # Exit here if dry run
+    if [ "$DRY_RUN" = true ]; then
+        log "INFO" "Dry run: would have run system prune with all options"
+        echo -e "${COLOR_GREEN}Dry run: would have run system prune with all options${COLOR_RESET}"
+        return 0
+    fi
 
-  # Ask for confirmation
-  echo "CAUTION: Docker system prune with --all --volumes will remove:"
-  echo "  - all stopped containers"
-  echo "  - all networks not used by at least one container"
-  echo "  - all volumes not used by at least one container"
-  echo "  - all images without at least one container associated to them"
-  echo "  - all build cache"
+    # Ask for confirmation
+    echo -e "${COLOR_YELLOW}${COLOR_BOLD}CAUTION: Docker system prune with --all --volumes will remove:${COLOR_RESET}"
+    echo -e "  ${COLOR_YELLOW}* All stopped containers${COLOR_RESET}"
+    echo -e "  ${COLOR_YELLOW}* All networks not used by at least one container${COLOR_RESET}"
+    echo -e "  ${COLOR_YELLOW}* All volumes not used by at least one container${COLOR_RESET}"
+    echo -e "  ${COLOR_YELLOW}* All images without at least one container associated to them${COLOR_RESET}"
+    echo -e "  ${COLOR_YELLOW}* All build cache${COLOR_RESET}"
 
-  if ! confirm_action "This operation cannot be undone. Continue?"; then
-    log "INFO" "System prune canceled by user"
-    echo "System prune canceled."
-    return 0
-  fi
+    if ! confirm_action "This operation cannot be undone. Continue?"; then
+        log "INFO" "System prune canceled by user"
+        echo -e "${COLOR_GREEN}System prune canceled.${COLOR_RESET}"
+        return 0
+    fi
 
-  # Run system prune
-  log "INFO" "Executing system prune..."
-  docker system prune --all --volumes --force
+    # Run system prune
+    log "INFO" "Executing system prune..."
+    echo -e "${COLOR_CYAN}${COLOR_BOLD}Executing system prune...${COLOR_RESET}"
+    docker system prune --all --volumes --force
 
-  log "INFO" "System prune completed"
-  echo "System prune completed"
+    log "INFO" "System prune completed"
+    echo -e "${COLOR_GREEN}System prune completed${COLOR_RESET}"
 }
 
 # Display system information
 show_system_information() {
-  log "INFO" "Collecting Docker system information..."
-  echo ""
-  echo "Docker System Information:"
-  echo "-------------------------"
-
-  # Docker version info
-  echo "Docker Version:"
-  docker version --format 'Client: {{.Client.Version}}, Server: {{.Server.Version}}'
-
-  # System disk usage
-  echo ""
-  echo "Docker Disk Usage Summary:"
-  docker system df
-
-  # Current resources
-  echo ""
-  echo "Current Resources:"
-  echo "  Images: $(docker images -q | wc -l)"
-  echo "  Containers (all): $(docker ps -a -q | wc -l)"
-  echo "  Containers (running): $(docker ps -q | wc -l)"
-  echo "  Volumes: $(docker volume ls -q | wc -l)"
-  echo "  Networks: $(docker network ls -q | wc -l)"
-
-  if command -v df >/dev/null 2>&1; then
+    log "INFO" "Collecting Docker system information..."
     echo ""
-    echo "Host Disk Usage:"
-    df -h $(docker info --format '{{.DockerRootDir}}' | cut -d':' -f1) | head -2
-  fi
+    echo -e "${COLOR_CYAN}${COLOR_BOLD}Docker System Information:${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}-------------------------${COLOR_RESET}"
 
-  echo ""
+    # Docker version info
+    echo -e "${COLOR_BLUE}Docker Version:${COLOR_RESET}"
+    docker version --format "Client: ${COLOR_GREEN}{{.Client.Version}}${COLOR_RESET}, Server: ${COLOR_GREEN}{{.Server.Version}}${COLOR_RESET}"
+
+    # System disk usage
+    echo ""
+    echo -e "${COLOR_BLUE}Docker Disk Usage Summary:${COLOR_RESET}"
+    docker system df
+
+    # Current resources
+    echo ""
+    echo -e "${COLOR_BLUE}Current Resources:${COLOR_RESET}"
+    echo -e "  ${COLOR_GREEN}Images:${COLOR_RESET} $(docker images -q | wc -l)"
+    echo -e "  ${COLOR_GREEN}Containers (all):${COLOR_RESET} $(docker ps -a -q | wc -l)"
+    echo -e "  ${COLOR_GREEN}Containers (running):${COLOR_RESET} $(docker ps -q | wc -l)"
+    echo -e "  ${COLOR_GREEN}Volumes:${COLOR_RESET} $(docker volume ls -q | wc -l)"
+    echo -e "  ${COLOR_GREEN}Networks:${COLOR_RESET} $(docker network ls -q | wc -l)"
+
+    # Show Borg repository info if available
+    if command_exists borg && borg info "$BACKUP_DIR" >/dev/null 2>&1; then
+        echo ""
+        echo -e "${COLOR_BLUE}Borg Repository Information:${COLOR_RESET}"
+
+        # Get number of archives
+        local archive_count=$(borg list --short "$BACKUP_DIR" | wc -l)
+        echo -e "  ${COLOR_GREEN}Repository:${COLOR_RESET} $BACKUP_DIR"
+        echo -e "  ${COLOR_GREEN}Archives:${COLOR_RESET} $archive_count"
+
+        # Get repository size
+        local repo_info=$(borg info --json "$BACKUP_DIR" 2>/dev/null)
+        if [ -n "$repo_info" ]; then
+            local total_size=$(echo "$repo_info" | grep -o '"total_size":[0-9]*' | cut -d':' -f2)
+            local total_unique=$(echo "$repo_info" | grep -o '"unique_size":[0-9]*' | cut -d':' -f2)
+
+            # Convert to human-readable format
+            if [ -n "$total_size" ] && [ -n "$total_unique" ]; then
+                # Convert to MB
+                total_size=$((total_size / 1024 / 1024))
+                total_unique=$((total_unique / 1024 / 1024))
+                echo -e "  ${COLOR_GREEN}Total Size:${COLOR_RESET} ${total_size}MB"
+                echo -e "  ${COLOR_GREEN}Unique Data:${COLOR_RESET} ${total_unique}MB"
+
+                # Calculate deduplication ratio if possible
+                if [ "$total_unique" -gt 0 ]; then
+                    local dedup_ratio=$(echo "scale=2; $total_size / $total_unique" | bc)
+                    echo -e "  ${COLOR_GREEN}Deduplication Ratio:${COLOR_RESET} ${dedup_ratio}x"
+                fi
+            fi
+        fi
+    fi
+
+    # Show host disk usage
+    if command -v df >/dev/null 2>&1; then
+        echo ""
+        echo -e "${COLOR_BLUE}Host Disk Usage:${COLOR_RESET}"
+        df -h $(docker info --format '{{.DockerRootDir}}' | cut -d':' -f1) | head -2
+    fi
+
+    echo ""
+}
+
+# Function to display a nice header
+display_header() {
+    echo -e "${COLOR_CYAN}${COLOR_BOLD}"
+    echo "======================================================="
+    echo "        Docker Volume Tools - Cleanup"
+    echo "======================================================="
+    echo -e "${COLOR_RESET}"
 }
 
 # Main execution
-log "INFO" "==========================================="
-log "INFO" "Starting Docker cleanup process"
-log "INFO" "==========================================="
+main() {
+    display_header
 
-# Verify permissions
-verify_permissions
+    log "INFO" "Starting Docker cleanup process"
 
-# Display dry run warning if enabled
-if [ "$DRY_RUN" = true ]; then
-  echo "DRY RUN MODE: No resources will be removed"
-  log "INFO" "Running in dry run mode"
-fi
+    # Verify permissions
+    verify_docker_access
 
-# Show system information first
-show_system_information
+    # Check Borg installation if needed
+    check_borg_installation
 
-# Run selected cleanup operations
-if [ "$PRUNE_ALL" = true ]; then
-  run_system_prune
-else
-  if [ "$CLEAN_VOLUMES" = true ]; then
-    clean_volumes
-  fi
+    # Display dry run warning if enabled
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${COLOR_YELLOW}DRY RUN MODE: No resources will be removed${COLOR_RESET}"
+        log "INFO" "Running in dry run mode"
+    fi
 
-  if [ "$CLEAN_TEMP_VOLUMES" = true ]; then
-    clean_temp_volumes
-  fi
+    # Show system information first
+    show_system_information
 
-  if [ "$CLEAN_IMAGES" = true ]; then
-    clean_images
-  fi
+    # Run selected cleanup operations
+    if [ "$PRUNE_ALL" = true ]; then
+        run_system_prune
+    else
+        if [ "$CLEAN_ALL" = true ]; then
+            CLEAN_VOLUMES=true
+            CLEAN_IMAGES=true
+            CLEAN_CONTAINERS=true
+            CLEAN_NETWORKS=true
+            CLEAN_BUILDER=true
+        fi
 
-  if [ "$CLEAN_CONTAINERS" = true ]; then
-    clean_containers
-  fi
+        if [ "$CLEAN_VOLUMES" = true ]; then
+            clean_volumes
+        fi
 
-  if [ "$CLEAN_NETWORKS" = true ]; then
-    clean_networks
-  fi
+        if [ "$CLEAN_IMAGES" = true ]; then
+            clean_images
+        fi
 
-  if [ "$CLEAN_BUILDER" = true ]; then
-    clean_builder
-  fi
-fi
+        if [ "$CLEAN_CONTAINERS" = true ]; then
+            clean_containers
+        fi
 
-log "INFO" "==========================================="
-log "INFO" "Docker cleanup process completed"
-log "INFO" "==========================================="
+        if [ "$CLEAN_NETWORKS" = true ]; then
+            clean_networks
+        fi
 
-# Print cleanup summary
-if [ "$DRY_RUN" = true ]; then
-  echo "Dry run completed. No resources were removed."
-else
-  echo "Cleanup completed successfully!"
-fi
+        if [ "$CLEAN_BUILDER" = true ]; then
+            clean_builder
+        fi
 
-# Display total disk space reclaimed (if available)
-if command -v df >/dev/null 2>&1; then
-  echo "Current disk usage:"
-  df -h $(docker info --format '{{.DockerRootDir}}' | cut -d':' -f1)
-fi
+        if [ "$CLEAN_BORG" = true ]; then
+            clean_borg
+        fi
 
-exit 0
+        if [ "$OLD_BACKUPS_DAYS" -gt 0 ]; then
+            clean_old_backups "$OLD_BACKUPS_DAYS"
+        fi
+
+        if [ "$CLEAN_ALL_BORG" = true ]; then
+            clean_all_borg
+        fi
+    fi
+
+    log "INFO" "Docker cleanup process completed"
+
+    # Print cleanup summary
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${COLOR_YELLOW}Dry run completed. No resources were removed.${COLOR_RESET}"
+    else
+        echo -e "${COLOR_GREEN}${COLOR_BOLD}Cleanup completed successfully!${COLOR_RESET}"
+    fi
+
+    # Display total disk space reclaimed (if available)
+    if command -v df >/dev/null 2>&1; then
+        echo -e "${COLOR_BLUE}Current disk usage:${COLOR_RESET}"
+        df -h $(docker info --format '{{.DockerRootDir}}' | cut -d':' -f1)
+    fi
+}
+
+# Ensure log directory exists
+ensure_log_directory
+
+# Run the main function
+main
+exit $?
