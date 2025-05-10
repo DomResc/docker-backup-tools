@@ -227,8 +227,65 @@ check_borg_installation() {
     if [ "$CLEAN_BORG" = true ] || [ "$CLEAN_ALL_BORG" = true ] || [ "$OLD_BACKUPS_DAYS" -gt 0 ]; then
         if ! command_exists borg; then
             log "ERROR" "Borg Backup is not installed"
-            echo -e "${COLOR_RED}ERROR: Borg Backup is required for Borg-related operations${COLOR_RESET}"
-            exit 1
+
+            # Verifica se lo script di installazione è disponibile
+            local install_script="/usr/local/bin/docker_install.sh"
+            local repo_install_script="./docker_install.sh"
+
+            if [ -f "$install_script" ]; then
+                echo -e "${COLOR_YELLOW}Would you like to run the installation script? ($install_script)${COLOR_RESET}"
+                if [ "$FORCE" != "true" ]; then
+                    read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
+                    if [ "$run_install" == "y" ]; then
+                        log "INFO" "Running installation script"
+                        sudo "$install_script"
+
+                        # Verifica se l'installazione ha avuto successo
+                        if ! command_exists borg; then
+                            log "ERROR" "Installation failed. Borg is still not available."
+                            exit 1
+                        else
+                            log "INFO" "Borg installed successfully"
+                            return 0
+                        fi
+                    else
+                        log "INFO" "Cleanup canceled because Borg is not installed"
+                        exit 1
+                    fi
+                else
+                    exit 1
+                fi
+            elif [ -f "$repo_install_script" ]; then
+                echo -e "${COLOR_YELLOW}Would you like to run the installation script? ($repo_install_script)${COLOR_RESET}"
+                if [ "$FORCE" != "true" ]; then
+                    read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
+                    if [ "$run_install" == "y" ]; then
+                        log "INFO" "Running installation script"
+                        sudo "$repo_install_script"
+
+                        # Verifica se l'installazione ha avuto successo
+                        if ! command_exists borg; then
+                            log "ERROR" "Installation failed. Borg is still not available."
+                            exit 1
+                        else
+                            log "INFO" "Borg installed successfully"
+                            return 0
+                        fi
+                    else
+                        log "INFO" "Cleanup canceled because Borg is not installed"
+                        exit 1
+                    fi
+                else
+                    exit 1
+                fi
+            else
+                echo -e "${COLOR_RED}Installation script not found.${COLOR_RESET}"
+                echo -e "${COLOR_YELLOW}Please install Docker Volume Tools first with:${COLOR_RESET}"
+                echo -e "${COLOR_CYAN}git clone https://github.com/domresc/docker-volume-tools.git${COLOR_RESET}"
+                echo -e "${COLOR_CYAN}cd docker-volume-tools${COLOR_RESET}"
+                echo -e "${COLOR_CYAN}sudo bash docker_install.sh${COLOR_RESET}"
+                exit 1
+            fi
         fi
 
         # Check if it's a valid borg repository
@@ -245,16 +302,26 @@ check_borg_installation() {
 # Helper function to ask for confirmation
 confirm_action() {
     local message="$1"
+    local require_yes="${2:-false}" # se true, richiede "yes" invece di "y"
 
     if [ "$FORCE" = true ]; then
         return 0
     fi
 
-    read -p "$(echo -e "${COLOR_YELLOW}$message (y/n): ${COLOR_RESET}")" confirm
-    if [ "$confirm" = "y" ]; then
-        return 0
+    if [ "$require_yes" = true ]; then
+        read -p "$(echo -e "${COLOR_YELLOW}$message (yes/no): ${COLOR_RESET}")" confirm
+        if [ "$confirm" = "yes" ]; then
+            return 0
+        else
+            return 1
+        fi
     else
-        return 1
+        read -p "$(echo -e "${COLOR_YELLOW}$message (y/n): ${COLOR_RESET}")" confirm
+        if [ "$confirm" = "y" ]; then
+            return 0
+        else
+            return 1
+        fi
     fi
 }
 
@@ -596,14 +663,14 @@ clean_all_borg() {
 
     # Ask for extra confirmation for this dangerous operation
     echo -e "${COLOR_RED}${COLOR_BOLD}DANGER: This operation will delete ALL backups and CANNOT be undone!${COLOR_RESET}"
-    if ! confirm_action "Are you ABSOLUTELY SURE you want to delete ALL backups? Type 'yes' to confirm"; then
+    if ! confirm_action "Are you ABSOLUTELY SURE you want to delete ALL backups?" true; then
         log "INFO" "Complete backup deletion canceled by user"
         echo -e "${COLOR_GREEN}Complete backup deletion canceled.${COLOR_RESET}"
         return 0
     fi
 
     # Double-check with an extra confirmation
-    if ! confirm_action "Last chance! Are you really sure you want to delete ALL Docker backups?"; then
+    if ! confirm_action "Last chance! Are you really sure you want to delete ALL Docker backups?" true; then
         log "INFO" "Complete backup deletion canceled by user"
         echo -e "${COLOR_GREEN}Complete backup deletion canceled.${COLOR_RESET}"
         return 0
@@ -652,7 +719,7 @@ run_system_prune() {
     echo -e "  ${COLOR_YELLOW}* All images without at least one container associated to them${COLOR_RESET}"
     echo -e "  ${COLOR_YELLOW}* All build cache${COLOR_RESET}"
 
-    if ! confirm_action "This operation cannot be undone. Continue?"; then
+    if ! confirm_action "This operation cannot be undone. Continue?" true; then
         log "INFO" "System prune canceled by user"
         echo -e "${COLOR_GREEN}System prune canceled.${COLOR_RESET}"
         return 0

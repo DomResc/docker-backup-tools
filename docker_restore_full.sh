@@ -42,7 +42,7 @@ COLOR_CYAN="\033[0;36m"
 COLOR_WHITE="\033[0;37m"
 COLOR_BOLD="\033[1m"
 
-# Flag to track if we restarted docker
+# Flag to track if we stopped docker
 DOCKER_STOPPED=false
 
 # Parse command line arguments
@@ -153,16 +153,65 @@ command_exists() {
 check_borg_installation() {
   if ! command_exists borg; then
     log "ERROR" "Borg Backup is not installed"
-    echo -e "${COLOR_YELLOW}Borg Backup is required for this script.${COLOR_RESET}"
-    echo ""
-    echo -e "${COLOR_CYAN}To install Borg:${COLOR_RESET}"
-    echo -e "  - On Debian/Ubuntu: ${COLOR_GREEN}sudo apt-get install borgbackup${COLOR_RESET}"
-    echo -e "  - On CentOS/RHEL: ${COLOR_GREEN}sudo yum install borgbackup${COLOR_RESET}"
-    echo -e "  - On Alpine Linux: ${COLOR_GREEN}apk add borgbackup${COLOR_RESET}"
-    echo -e "  - On macOS: ${COLOR_GREEN}brew install borgbackup${COLOR_RESET}"
-    echo ""
-    echo -e "For other systems, see: ${COLOR_BLUE}https://borgbackup.org/install.html${COLOR_RESET}"
-    exit 1
+
+    # Verifica se lo script di installazione è disponibile
+    local install_script="/usr/local/bin/docker_install.sh"
+    local repo_install_script="./docker_install.sh"
+
+    if [ -f "$install_script" ]; then
+      echo -e "${COLOR_YELLOW}Would you like to run the installation script? ($install_script)${COLOR_RESET}"
+      if [ "$FORCE" != "true" ]; then
+        read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
+        if [ "$run_install" == "y" ]; then
+          log "INFO" "Running installation script"
+          sudo "$install_script"
+
+          # Verifica se l'installazione ha avuto successo
+          if ! command_exists borg; then
+            log "ERROR" "Installation failed. Borg is still not available."
+            exit 1
+          else
+            log "INFO" "Borg installed successfully"
+            return 0
+          fi
+        else
+          log "INFO" "Restoration canceled because Borg is not installed"
+          exit 1
+        fi
+      else
+        exit 1
+      fi
+    elif [ -f "$repo_install_script" ]; then
+      echo -e "${COLOR_YELLOW}Would you like to run the installation script? ($repo_install_script)${COLOR_RESET}"
+      if [ "$FORCE" != "true" ]; then
+        read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
+        if [ "$run_install" == "y" ]; then
+          log "INFO" "Running installation script"
+          sudo "$repo_install_script"
+
+          # Verifica se l'installazione ha avuto successo
+          if ! command_exists borg; then
+            log "ERROR" "Installation failed. Borg is still not available."
+            exit 1
+          else
+            log "INFO" "Borg installed successfully"
+            return 0
+          fi
+        else
+          log "INFO" "Restoration canceled because Borg is not installed"
+          exit 1
+        fi
+      else
+        exit 1
+      fi
+    else
+      echo -e "${COLOR_RED}Installation script not found.${COLOR_RESET}"
+      echo -e "${COLOR_YELLOW}Please install Docker Volume Tools first with:${COLOR_RESET}"
+      echo -e "${COLOR_CYAN}git clone https://github.com/domresc/docker-volume-tools.git${COLOR_RESET}"
+      echo -e "${COLOR_CYAN}cd docker-volume-tools${COLOR_RESET}"
+      echo -e "${COLOR_CYAN}sudo bash docker_install.sh${COLOR_RESET}"
+      exit 1
+    fi
   fi
 
   log "INFO" "Borg Backup is installed"
@@ -190,6 +239,46 @@ check_repository() {
   fi
 
   log "INFO" "Valid Borg repository found at $BACKUP_DIR"
+}
+
+# Check disk space for restoration
+check_disk_space() {
+  local archive="$1"
+  log "INFO" "Checking disk space for restoration"
+
+  # Get archive info
+  local archive_info=$(borg info --json "$BACKUP_DIR::$archive" 2>/dev/null)
+  local archive_size=$(echo "$archive_info" | grep -o '"original_size": [0-9]*' | cut -d' ' -f2)
+
+  if [ -z "$archive_size" ]; then
+    log "WARNING" "Could not determine archive size. Make sure you have sufficient disk space."
+    return 0
+  fi
+
+  # Add 10% overhead
+  local needed_space=$((archive_size + (archive_size / 10)))
+  needed_space=$((needed_space / 1024 / 1024)) # Convert to MB
+
+  # Get available space in /var/lib
+  local available_space=$(df -m "$(dirname "$DOCKER_DIR")" | awk 'NR==2 {print $4}')
+
+  log "INFO" "Archive size: $((archive_size / 1024 / 1024)) MB"
+  log "INFO" "Estimated space needed: $needed_space MB"
+  log "INFO" "Available space: $available_space MB"
+
+  if [ "$available_space" -lt "$needed_space" ]; then
+    log "WARNING" "Available space ($available_space MB) might be insufficient for restoration ($needed_space MB)"
+
+    if [ "$FORCE" != "true" ]; then
+      read -p "$(echo -e "${COLOR_YELLOW}Available space may be insufficient. Continue anyway? (y/n): ${COLOR_RESET}")" confirm
+      if [ "$confirm" != "y" ]; then
+        log "INFO" "Restoration canceled by user due to space concerns"
+        exit 0
+      fi
+    else
+      log "WARNING" "Continuing despite potential space issues due to force flag"
+    fi
+  fi
 }
 
 # Show list of available archives
@@ -239,12 +328,70 @@ show_archives() {
   echo "${archives[@]}"
 }
 
+# Manage Docker service (start/stop) with compatibility for different init systems
+manage_docker_service() {
+  local action="$1" # 'start' o 'stop'
+
+  # Verifica quale sistema init è in uso
+  if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+    # systemd
+    log "INFO" "Using systemd to $action Docker"
+    sudo systemctl $action $DOCKER_SERVICE
+  elif command -v service >/dev/null 2>&1; then
+    # SysV init o upstart
+    log "INFO" "Using service command to $action Docker"
+    sudo service docker $action
+  elif [ -f /etc/init.d/docker ]; then
+    # SysV init script diretto
+    log "INFO" "Using init.d script to $action Docker"
+    sudo /etc/init.d/docker $action
+  else
+    # Fallback a comandi diretti
+    if [ "$action" = "stop" ]; then
+      log "INFO" "Using killall to stop Docker"
+      sudo killall -TERM dockerd
+    else
+      log "INFO" "Starting Docker daemon directly"
+      sudo dockerd &
+    fi
+  fi
+
+  # Verifica lo stato dell'operazione
+  local max_wait=30
+  local counter=0
+  local expected_status=$([[ "$action" = "start" ]] && echo "running" || echo "stopped")
+
+  while true; do
+    sleep 1
+    counter=$((counter + 1))
+
+    if docker info >/dev/null 2>&1; then
+      local current_status="running"
+    else
+      local current_status="stopped"
+    fi
+
+    if [ "$current_status" = "$expected_status" ]; then
+      break
+    fi
+
+    if [ $counter -ge $max_wait ]; then
+      log "ERROR" "Failed to $action Docker service within $max_wait seconds"
+      echo -e "${COLOR_RED}ERROR: Failed to $action Docker service${COLOR_RESET}"
+      return 1
+    fi
+  done
+
+  log "INFO" "Docker service $action successfully"
+  return 0
+}
+
 # Stop Docker service
 stop_docker() {
   log "INFO" "Stopping Docker service"
 
   # Check if Docker is running
-  if ! systemctl is-active --quiet $DOCKER_SERVICE; then
+  if ! docker info >/dev/null 2>&1; then
     log "INFO" "Docker service is already stopped"
     return 0
   fi
@@ -259,46 +406,30 @@ stop_docker() {
   fi
 
   log "INFO" "Stopping Docker service now"
-  sudo systemctl stop $DOCKER_SERVICE
+  manage_docker_service stop
+  local stop_result=$?
 
-  # Wait for Docker to stop
-  local max_wait=30
-  local counter=0
-  while systemctl is-active --quiet $DOCKER_SERVICE; do
-    sleep 1
-    counter=$((counter + 1))
-    if [ $counter -ge $max_wait ]; then
-      log "ERROR" "Failed to stop Docker service within $max_wait seconds"
-      echo -e "${COLOR_RED}ERROR: Failed to stop Docker service${COLOR_RESET}"
-      exit 1
-    fi
-  done
-
-  DOCKER_STOPPED=true
-  log "INFO" "Docker service stopped successfully"
+  if [ $stop_result -eq 0 ]; then
+    DOCKER_STOPPED=true
+  else
+    echo -e "${COLOR_RED}ERROR: Failed to stop Docker service${COLOR_RESET}"
+    exit 1
+  fi
 }
 
 # Start Docker service
 start_docker() {
   if [ "$DOCKER_STOPPED" = true ]; then
     log "INFO" "Starting Docker service"
-    sudo systemctl start $DOCKER_SERVICE
+    manage_docker_service start
+    local start_result=$?
 
-    # Wait for Docker to start
-    local max_wait=60
-    local counter=0
-    while ! systemctl is-active --quiet $DOCKER_SERVICE; do
-      sleep 1
-      counter=$((counter + 1))
-      if [ $counter -ge $max_wait ]; then
-        log "ERROR" "Failed to start Docker service within $max_wait seconds"
-        echo -e "${COLOR_RED}ERROR: Failed to start Docker service${COLOR_RESET}"
-        echo -e "${COLOR_YELLOW}You may need to start it manually with: sudo systemctl start $DOCKER_SERVICE${COLOR_RESET}"
-        return 1
-      fi
-    done
-
-    log "INFO" "Docker service started successfully"
+    if [ $start_result -ne 0 ]; then
+      log "ERROR" "Failed to start Docker service"
+      echo -e "${COLOR_RED}ERROR: Failed to start Docker service${COLOR_RESET}"
+      echo -e "${COLOR_YELLOW}You may need to start it manually with: sudo systemctl start $DOCKER_SERVICE${COLOR_RESET}"
+      return 1
+    fi
   else
     log "INFO" "Docker was not stopped, no need to start it"
   fi
@@ -355,6 +486,29 @@ backup_docker_dir() {
   return 0
 }
 
+# Set Docker permissions correctly
+set_docker_permissions() {
+  log "INFO" "Setting proper permissions on Docker directory"
+
+  # Imposta proprietà di base
+  sudo chown -R root:root "$DOCKER_DIR"
+
+  # Imposta permessi specifici per sottodirectory Docker
+  if [ -d "$DOCKER_DIR/volumes" ]; then
+    sudo chmod 711 "$DOCKER_DIR/volumes"
+    # Imposta permessi ricorsivi per le sottodirectory dei volumi
+    find "$DOCKER_DIR/volumes" -type d -exec sudo chmod 755 {} \;
+  fi
+
+  # Imposta permessi per i file di configurazione
+  if [ -d "$DOCKER_DIR/containers" ]; then
+    sudo chmod 710 "$DOCKER_DIR/containers"
+    find "$DOCKER_DIR/containers" -type f -name "*.json" -exec sudo chmod 640 {} \;
+  fi
+
+  log "INFO" "Docker permissions set successfully"
+}
+
 # Restore an archive
 restore_archive() {
   local archive="$1"
@@ -369,17 +523,22 @@ restore_archive() {
     exit 1
   fi
 
+  # Check disk space
+  check_disk_space "$archive"
+
   # Stop Docker service
   stop_docker
 
   # Backup current Docker directory
   backup_docker_dir
 
-  # Extract the archive
+  # Extract the archive - FIXED: specifying correct extraction path and strategy
   log "INFO" "Extracting archive $archive to $DOCKER_DIR"
   echo -e "${COLOR_CYAN}${COLOR_BOLD}Extracting backup archive... This may take some time.${COLOR_RESET}"
 
-  if ! sudo borg extract --progress "$BACKUP_DIR::$archive"; then
+  # Cambia directory alla radice e limita l'estrazione a /var/lib/docker
+  cd /
+  if ! sudo borg extract --progress "$BACKUP_DIR::$archive" var/lib/docker; then
     log "ERROR" "Failed to extract archive"
     echo -e "${COLOR_RED}ERROR: Failed to extract archive${COLOR_RESET}"
     start_docker
@@ -392,14 +551,23 @@ restore_archive() {
   log "INFO" "Archive extracted successfully in $duration seconds"
 
   # Set proper permissions on Docker directory
-  log "INFO" "Setting proper permissions on Docker directory"
-  sudo chown -R root:root "$DOCKER_DIR"
+  set_docker_permissions
 
   # Start Docker service
   start_docker
 
+  # Verify Docker is running properly
+  log "INFO" "Verifying Docker restored correctly"
+  if ! docker info >/dev/null 2>&1; then
+    log "ERROR" "Docker failed to start properly after restoration"
+    echo -e "${COLOR_RED}ERROR: Docker failed to start properly after restoration${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}You may need to restore from a different backup or check Docker logs${COLOR_RESET}"
+    return 1
+  fi
+
   log "INFO" "Restore operation completed successfully"
   echo -e "${COLOR_GREEN}${COLOR_BOLD}Restore completed successfully!${COLOR_RESET}"
+  echo -e "${COLOR_CYAN}Your previous Docker directory was backed up to: ${DOCKER_DIR}.bak.*${COLOR_RESET}"
 
   return 0
 }

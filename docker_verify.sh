@@ -167,16 +167,65 @@ command_exists() {
 check_borg_installation() {
   if ! command_exists borg; then
     log "ERROR" "Borg Backup is not installed"
-    echo -e "${COLOR_YELLOW}Borg Backup is required for this script.${COLOR_RESET}"
-    echo ""
-    echo -e "${COLOR_CYAN}To install Borg:${COLOR_RESET}"
-    echo -e "  - On Debian/Ubuntu: ${COLOR_GREEN}sudo apt-get install borgbackup${COLOR_RESET}"
-    echo -e "  - On CentOS/RHEL: ${COLOR_GREEN}sudo yum install borgbackup${COLOR_RESET}"
-    echo -e "  - On Alpine Linux: ${COLOR_GREEN}apk add borgbackup${COLOR_RESET}"
-    echo -e "  - On macOS: ${COLOR_GREEN}brew install borgbackup${COLOR_RESET}"
-    echo ""
-    echo -e "For other systems, see: ${COLOR_BLUE}https://borgbackup.org/install.html${COLOR_RESET}"
-    exit 1
+
+    # Verifica se lo script di installazione è disponibile
+    local install_script="/usr/local/bin/docker_install.sh"
+    local repo_install_script="./docker_install.sh"
+
+    if [ -f "$install_script" ]; then
+      echo -e "${COLOR_YELLOW}Would you like to run the installation script? ($install_script)${COLOR_RESET}"
+      if [ "$QUIET_MODE" != "true" ]; then
+        read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
+        if [ "$run_install" == "y" ]; then
+          log "INFO" "Running installation script"
+          sudo "$install_script"
+
+          # Verifica se l'installazione ha avuto successo
+          if ! command_exists borg; then
+            log "ERROR" "Installation failed. Borg is still not available."
+            exit 1
+          else
+            log "INFO" "Borg installed successfully"
+            return 0
+          fi
+        else
+          log "INFO" "Verification canceled because Borg is not installed"
+          exit 1
+        fi
+      else
+        exit 1
+      fi
+    elif [ -f "$repo_install_script" ]; then
+      echo -e "${COLOR_YELLOW}Would you like to run the installation script? ($repo_install_script)${COLOR_RESET}"
+      if [ "$QUIET_MODE" != "true" ]; then
+        read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
+        if [ "$run_install" == "y" ]; then
+          log "INFO" "Running installation script"
+          sudo "$repo_install_script"
+
+          # Verifica se l'installazione ha avuto successo
+          if ! command_exists borg; then
+            log "ERROR" "Installation failed. Borg is still not available."
+            exit 1
+          else
+            log "INFO" "Borg installed successfully"
+            return 0
+          fi
+        else
+          log "INFO" "Verification canceled because Borg is not installed"
+          exit 1
+        fi
+      else
+        exit 1
+      fi
+    else
+      echo -e "${COLOR_RED}Installation script not found.${COLOR_RESET}"
+      echo -e "${COLOR_YELLOW}Please install Docker Volume Tools first with:${COLOR_RESET}"
+      echo -e "${COLOR_CYAN}git clone https://github.com/domresc/docker-volume-tools.git${COLOR_RESET}"
+      echo -e "${COLOR_CYAN}cd docker-volume-tools${COLOR_RESET}"
+      echo -e "${COLOR_CYAN}sudo bash docker_install.sh${COLOR_RESET}"
+      exit 1
+    fi
   fi
 
   log "INFO" "Borg Backup is installed"

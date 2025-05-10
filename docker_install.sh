@@ -39,7 +39,44 @@ COLOR_BOLD="\033[1m"
 INSTALL_DIR="/usr/local/bin"
 BACKUP_DIR="/backup/docker"
 LOG_DIR="/var/log/docker"
-SCRIPT_NAMES=("docker_backup_full.sh" "docker_restore_full.sh" "docker_verify.sh")
+SCRIPT_NAMES=("docker_backup_full.sh" "docker_restore_full.sh" "docker_verify.sh" "docker_cleanup.sh")
+
+# Detect if Docker is installed
+check_docker_installation() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${COLOR_YELLOW}WARNING: Docker does not appear to be installed on this system.${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}These tools require Docker to be installed and working properly.${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}Please install Docker before using Docker Volume Tools.${COLOR_RESET}"
+
+        read -p "$(echo -e "${COLOR_YELLOW}Continue installation anyway? (y/n): ${COLOR_RESET}")" continue_anyway
+        if [ "$continue_anyway" != "y" ]; then
+            echo -e "${COLOR_RED}Installation canceled.${COLOR_RESET}"
+            exit 1
+        fi
+
+        echo -e "${COLOR_YELLOW}Continuing installation without Docker. Make sure to install Docker later.${COLOR_RESET}"
+    else
+        echo -e "${COLOR_GREEN}Docker is installed.${COLOR_RESET}"
+        echo -e "${COLOR_BLUE}Docker version: $(docker --version)${COLOR_RESET}"
+    fi
+}
+
+# Detect the init system
+detect_init_system() {
+    if command -v systemctl &>/dev/null && systemctl --version &>/dev/null; then
+        echo -e "${COLOR_GREEN}Detected init system: systemd${COLOR_RESET}"
+        INIT_SYSTEM="systemd"
+    elif command -v service &>/dev/null; then
+        echo -e "${COLOR_GREEN}Detected init system: sysvinit/upstart${COLOR_RESET}"
+        INIT_SYSTEM="sysv"
+    elif [ -f /etc/init.d/docker ]; then
+        echo -e "${COLOR_GREEN}Detected init system: sysvinit${COLOR_RESET}"
+        INIT_SYSTEM="sysv"
+    else
+        echo -e "${COLOR_YELLOW}Could not detect init system. Will use fallback mechanisms for Docker service control.${COLOR_RESET}"
+        INIT_SYSTEM="unknown"
+    fi
+}
 
 # Check if script is run as root
 if [ "$(id -u)" -ne 0 ]; then
@@ -54,6 +91,12 @@ echo "======================================================="
 echo "        Docker Volume Tools - Installer"
 echo "======================================================="
 echo -e "${COLOR_RESET}"
+
+# Check Docker installation
+check_docker_installation
+
+# Detect init system
+detect_init_system
 
 # Check if borg is installed
 if ! command -v borg &>/dev/null; then
@@ -75,16 +118,28 @@ if ! command -v borg &>/dev/null; then
     else
         echo -e "${COLOR_RED}Unable to detect package manager.${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}Please install Borg manually: https://borgbackup.org/install.html${COLOR_RESET}"
-        exit 1
+
+        read -p "$(echo -e "${COLOR_YELLOW}Continue installation without Borg? (y/n): ${COLOR_RESET}")" continue_without_borg
+        if [ "$continue_without_borg" != "y" ]; then
+            echo -e "${COLOR_RED}Installation canceled.${COLOR_RESET}"
+            exit 1
+        fi
+
+        echo -e "${COLOR_YELLOW}Continuing installation without Borg. You'll need to install it manually later.${COLOR_RESET}"
     fi
 
     # Check if installation was successful
     if ! command -v borg &>/dev/null; then
-        echo -e "${COLOR_RED}Failed to install Borg. Please install it manually.${COLOR_RESET}"
-        exit 1
+        echo -e "${COLOR_RED}Failed to install Borg automatically.${COLOR_RESET}"
+        read -p "$(echo -e "${COLOR_YELLOW}Continue installation without Borg? (y/n): ${COLOR_RESET}")" continue_without_borg
+        if [ "$continue_without_borg" != "y" ]; then
+            echo -e "${COLOR_RED}Installation canceled.${COLOR_RESET}"
+            exit 1
+        fi
+        echo -e "${COLOR_YELLOW}Continuing installation without Borg. You'll need to install it manually later.${COLOR_RESET}"
+    else
+        echo -e "${COLOR_GREEN}Borg installed successfully!${COLOR_RESET}"
     fi
-
-    echo -e "${COLOR_GREEN}Borg installed successfully!${COLOR_RESET}"
 else
     echo -e "${COLOR_GREEN}Borg Backup is already installed.${COLOR_RESET}"
     echo -e "${COLOR_BLUE}Borg version: $(borg --version)${COLOR_RESET}"
@@ -133,6 +188,11 @@ for script in "${SCRIPT_NAMES[@]}"; do
     echo -e "${COLOR_GREEN}Installed: $INSTALL_DIR/$script${COLOR_RESET}"
 done
 
+# Also install the install script itself
+cp "./docker_install.sh" "$INSTALL_DIR/"
+chmod +x "$INSTALL_DIR/docker_install.sh"
+echo -e "${COLOR_GREEN}Installed: $INSTALL_DIR/docker_install.sh${COLOR_RESET}"
+
 # Create symlinks without .sh extension
 echo -e "${COLOR_BLUE}Creating symlinks without .sh extension...${COLOR_RESET}"
 
@@ -141,6 +201,10 @@ for script in "${SCRIPT_NAMES[@]}"; do
     ln -sf "$INSTALL_DIR/$script" "$INSTALL_DIR/$base_name"
     echo -e "${COLOR_GREEN}Created symlink: $INSTALL_DIR/$base_name${COLOR_RESET}"
 done
+
+# Create symlink for install script
+ln -sf "$INSTALL_DIR/docker_install.sh" "$INSTALL_DIR/docker_install"
+echo -e "${COLOR_GREEN}Created symlink: $INSTALL_DIR/docker_install${COLOR_RESET}"
 
 # Setup cron job for automated backups
 echo -e "${COLOR_BLUE}Setting up cron job for automated backups...${COLOR_RESET}"
@@ -198,6 +262,29 @@ else
     echo -e "${COLOR_BLUE}Skipping cron job setup.${COLOR_RESET}"
 fi
 
+# Initialize Borg repository if Borg is installed
+if command -v borg &>/dev/null; then
+    echo -e "${COLOR_BLUE}Would you like to initialize a Borg repository now?${COLOR_RESET}"
+    read -p "$(echo -e "${COLOR_YELLOW}Initialize repository at $BACKUP_DIR? (y/n): ${COLOR_RESET}")" init_repo
+
+    if [ "$init_repo" = "y" ]; then
+        if ! borg info "$BACKUP_DIR" >/dev/null 2>&1; then
+            echo -e "${COLOR_BLUE}Initializing Borg repository at $BACKUP_DIR...${COLOR_RESET}"
+            if borg init --encryption=none "$BACKUP_DIR"; then
+                echo -e "${COLOR_GREEN}Repository initialized successfully!${COLOR_RESET}"
+            else
+                echo -e "${COLOR_RED}Failed to initialize repository.${COLOR_RESET}"
+                echo -e "${COLOR_YELLOW}You can initialize it later with: borg init --encryption=none $BACKUP_DIR${COLOR_RESET}"
+            fi
+        else
+            echo -e "${COLOR_GREEN}Repository already exists at $BACKUP_DIR.${COLOR_RESET}"
+        fi
+    else
+        echo -e "${COLOR_BLUE}Skipping repository initialization.${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}You can initialize it later with: borg init --encryption=none $BACKUP_DIR${COLOR_RESET}"
+    fi
+fi
+
 # Installation completed
 echo -e "${COLOR_CYAN}${COLOR_BOLD}"
 echo "======================================================="
@@ -210,10 +297,12 @@ echo -e "${COLOR_BLUE}Available commands:${COLOR_RESET}"
 echo -e "  ${COLOR_GREEN}docker_backup_full${COLOR_RESET} - Backup all Docker data"
 echo -e "  ${COLOR_GREEN}docker_restore_full${COLOR_RESET} - Restore Docker from backup"
 echo -e "  ${COLOR_GREEN}docker_verify${COLOR_RESET} - Verify backup integrity"
+echo -e "  ${COLOR_GREEN}docker_cleanup${COLOR_RESET} - Clean Docker resources and backups"
 echo ""
 echo -e "${COLOR_BLUE}Backup directory:${COLOR_RESET} $BACKUP_DIR"
 echo -e "${COLOR_BLUE}Log directory:${COLOR_RESET} $LOG_DIR"
 echo ""
 echo -e "${COLOR_YELLOW}Try running 'docker_backup_full' to create your first backup!${COLOR_RESET}"
+echo -e "${COLOR_YELLOW}If you need to reinstall or update, run 'docker_install'.${COLOR_RESET}"
 
 exit 0

@@ -46,8 +46,8 @@ COLOR_CYAN="\033[0;36m"
 COLOR_WHITE="\033[0;37m"
 COLOR_BOLD="\033[1m"
 
-# Flag to track if we restarted docker
-DOCKER_RESTARTED=false
+# Flag to track if we stopped docker
+DOCKER_STOPPED=false
 
 # Parse command line arguments
 usage() {
@@ -176,50 +176,63 @@ command_exists() {
 check_borg_installation() {
     if ! command_exists borg; then
         log "ERROR" "Borg Backup is not installed"
-        echo -e "${COLOR_YELLOW}Borg Backup is required for this script.${COLOR_RESET}"
-        echo ""
-        echo -e "${COLOR_CYAN}To install Borg:${COLOR_RESET}"
-        echo -e "  - On Debian/Ubuntu: ${COLOR_GREEN}sudo apt-get install borgbackup${COLOR_RESET}"
-        echo -e "  - On CentOS/RHEL: ${COLOR_GREEN}sudo yum install borgbackup${COLOR_RESET}"
-        echo -e "  - On Alpine Linux: ${COLOR_GREEN}apk add borgbackup${COLOR_RESET}"
-        echo -e "  - On macOS: ${COLOR_GREEN}brew install borgbackup${COLOR_RESET}"
-        echo ""
-        echo -e "For other systems, see: ${COLOR_BLUE}https://borgbackup.org/install.html${COLOR_RESET}"
 
-        if [ "$FORCE" != "true" ]; then
-            read -p "$(echo -e "${COLOR_YELLOW}Would you like to try to install Borg now? (y/n): ${COLOR_RESET}")" install_borg
-            if [ "$install_borg" == "y" ]; then
-                # Try to detect OS and install
-                if command_exists apt-get; then
-                    log "INFO" "Attempting to install Borg using apt-get"
-                    sudo apt-get update && sudo apt-get install -y borgbackup
-                elif command_exists yum; then
-                    log "INFO" "Attempting to install Borg using yum"
-                    sudo yum install -y borgbackup
-                elif command_exists apk; then
-                    log "INFO" "Attempting to install Borg using apk"
-                    sudo apk add borgbackup
-                elif command_exists brew; then
-                    log "INFO" "Attempting to install Borg using brew"
-                    brew install borgbackup
-                else
-                    log "ERROR" "Could not detect package manager to install Borg"
-                    echo -e "${COLOR_RED}Please install Borg manually and try again.${COLOR_RESET}"
-                    exit 1
-                fi
+        # Verifica se lo script di installazione è disponibile
+        local install_script="/usr/local/bin/docker_install.sh"
+        local repo_install_script="./docker_install.sh"
 
-                if ! command_exists borg; then
-                    log "ERROR" "Failed to install Borg"
-                    exit 1
+        if [ -f "$install_script" ]; then
+            echo -e "${COLOR_YELLOW}Would you like to run the installation script? ($install_script)${COLOR_RESET}"
+            if [ "$FORCE" != "true" ]; then
+                read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
+                if [ "$run_install" == "y" ]; then
+                    log "INFO" "Running installation script"
+                    sudo "$install_script"
+
+                    # Verifica se l'installazione ha avuto successo
+                    if ! command_exists borg; then
+                        log "ERROR" "Installation failed. Borg is still not available."
+                        exit 1
+                    else
+                        log "INFO" "Borg installed successfully"
+                        return 0
+                    fi
                 else
-                    log "INFO" "Borg installed successfully"
+                    log "INFO" "Backup canceled because Borg is not installed"
+                    exit 1
                 fi
             else
-                log "INFO" "Backup canceled because Borg is not installed"
+                exit 1
+            fi
+        elif [ -f "$repo_install_script" ]; then
+            echo -e "${COLOR_YELLOW}Would you like to run the installation script? ($repo_install_script)${COLOR_RESET}"
+            if [ "$FORCE" != "true" ]; then
+                read -p "$(echo -e "${COLOR_YELLOW}Run installation script? (y/n): ${COLOR_RESET}")" run_install
+                if [ "$run_install" == "y" ]; then
+                    log "INFO" "Running installation script"
+                    sudo "$repo_install_script"
+
+                    # Verifica se l'installazione ha avuto successo
+                    if ! command_exists borg; then
+                        log "ERROR" "Installation failed. Borg is still not available."
+                        exit 1
+                    else
+                        log "INFO" "Borg installed successfully"
+                        return 0
+                    fi
+                else
+                    log "INFO" "Backup canceled because Borg is not installed"
+                    exit 1
+                fi
+            else
                 exit 1
             fi
         else
-            # In force mode, fail if borg not installed
+            echo -e "${COLOR_RED}Installation script not found.${COLOR_RESET}"
+            echo -e "${COLOR_YELLOW}Please install Docker Volume Tools first with:${COLOR_RESET}"
+            echo -e "${COLOR_CYAN}git clone https://github.com/domresc/docker-volume-tools.git${COLOR_RESET}"
+            echo -e "${COLOR_CYAN}cd docker-volume-tools${COLOR_RESET}"
+            echo -e "${COLOR_CYAN}sudo bash docker_install.sh${COLOR_RESET}"
             exit 1
         fi
     fi
@@ -305,12 +318,70 @@ check_disk_space() {
     fi
 }
 
+# Manage Docker service (start/stop) with compatibility for different init systems
+manage_docker_service() {
+    local action="$1" # 'start' o 'stop'
+
+    # Verifica quale sistema init è in uso
+    if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+        # systemd
+        log "INFO" "Using systemd to $action Docker"
+        sudo systemctl $action $DOCKER_SERVICE
+    elif command -v service >/dev/null 2>&1; then
+        # SysV init o upstart
+        log "INFO" "Using service command to $action Docker"
+        sudo service docker $action
+    elif [ -f /etc/init.d/docker ]; then
+        # SysV init script diretto
+        log "INFO" "Using init.d script to $action Docker"
+        sudo /etc/init.d/docker $action
+    else
+        # Fallback a comandi diretti
+        if [ "$action" = "stop" ]; then
+            log "INFO" "Using killall to stop Docker"
+            sudo killall -TERM dockerd
+        else
+            log "INFO" "Starting Docker daemon directly"
+            sudo dockerd &
+        fi
+    fi
+
+    # Verifica lo stato dell'operazione
+    local max_wait=30
+    local counter=0
+    local expected_status=$([[ "$action" = "start" ]] && echo "running" || echo "stopped")
+
+    while true; do
+        sleep 1
+        counter=$((counter + 1))
+
+        if docker info >/dev/null 2>&1; then
+            local current_status="running"
+        else
+            local current_status="stopped"
+        fi
+
+        if [ "$current_status" = "$expected_status" ]; then
+            break
+        fi
+
+        if [ $counter -ge $max_wait ]; then
+            log "ERROR" "Failed to $action Docker service within $max_wait seconds"
+            echo -e "${COLOR_RED}ERROR: Failed to $action Docker service${COLOR_RESET}"
+            return 1
+        fi
+    done
+
+    log "INFO" "Docker service $action successfully"
+    return 0
+}
+
 # Stop Docker service
 stop_docker() {
     log "INFO" "Stopping Docker service"
 
     # Check if Docker is running
-    if ! systemctl is-active --quiet $DOCKER_SERVICE; then
+    if ! docker info >/dev/null 2>&1; then
         log "INFO" "Docker service is already stopped"
         return 0
     fi
@@ -325,48 +396,32 @@ stop_docker() {
     fi
 
     log "INFO" "Stopping Docker service now"
-    sudo systemctl stop $DOCKER_SERVICE
+    manage_docker_service stop
+    local stop_result=$?
 
-    # Wait for Docker to stop
-    local max_wait=30
-    local counter=0
-    while systemctl is-active --quiet $DOCKER_SERVICE; do
-        sleep 1
-        counter=$((counter + 1))
-        if [ $counter -ge $max_wait ]; then
-            log "ERROR" "Failed to stop Docker service within $max_wait seconds"
-            echo -e "${COLOR_RED}ERROR: Failed to stop Docker service${COLOR_RESET}"
-            exit 1
-        fi
-    done
-
-    DOCKER_RESTARTED=true
-    log "INFO" "Docker service stopped successfully"
+    if [ $stop_result -eq 0 ]; then
+        DOCKER_STOPPED=true
+    else
+        echo -e "${COLOR_RED}ERROR: Failed to stop Docker service${COLOR_RESET}"
+        exit 1
+    fi
 }
 
 # Start Docker service
 start_docker() {
-    if [ "$DOCKER_RESTARTED" = true ]; then
+    if [ "$DOCKER_STOPPED" = true ]; then
         log "INFO" "Starting Docker service"
-        sudo systemctl start $DOCKER_SERVICE
+        manage_docker_service start
+        local start_result=$?
 
-        # Wait for Docker to start
-        local max_wait=60
-        local counter=0
-        while ! systemctl is-active --quiet $DOCKER_SERVICE; do
-            sleep 1
-            counter=$((counter + 1))
-            if [ $counter -ge $max_wait ]; then
-                log "ERROR" "Failed to start Docker service within $max_wait seconds"
-                echo -e "${COLOR_RED}ERROR: Failed to start Docker service${COLOR_RESET}"
-                echo -e "${COLOR_YELLOW}You may need to start it manually with: sudo systemctl start $DOCKER_SERVICE${COLOR_RESET}"
-                return 1
-            fi
-        done
-
-        log "INFO" "Docker service started successfully"
+        if [ $start_result -ne 0 ]; then
+            log "ERROR" "Failed to start Docker service"
+            echo -e "${COLOR_RED}ERROR: Failed to start Docker service${COLOR_RESET}"
+            echo -e "${COLOR_YELLOW}You may need to start it manually with: sudo systemctl start $DOCKER_SERVICE${COLOR_RESET}"
+            return 1
+        fi
     else
-        log "INFO" "Docker was not restarted, no need to start it"
+        log "INFO" "Docker was not stopped, no need to start it"
     fi
 
     return 0
