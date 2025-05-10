@@ -56,6 +56,8 @@ COLOR_BOLD="\033[1m"
 
 # Flag to track if we stopped docker
 DOCKER_STOPPED=false
+# Flag to track if we restarted docker
+DOCKER_RESTARTED=false
 
 # Parse command line arguments
 usage() {
@@ -434,6 +436,8 @@ start_docker() {
             echo -e "${COLOR_YELLOW}You may need to start it manually with: sudo systemctl start $DOCKER_SERVICE${COLOR_RESET}"
             return 1
         fi
+        # Aggiungi questa riga per tenere traccia del riavvio
+        DOCKER_RESTARTED=true
     else
         log "INFO" "Docker was not stopped, no need to start it"
     fi
@@ -521,7 +525,11 @@ cleanup_on_exit() {
     log "INFO" "Running cleanup on exit"
 
     # Make sure Docker is running
-    start_docker
+    if [ "$DOCKER_STOPPED" = true ] && [ "$DOCKER_RESTARTED" != true ]; then
+        start_docker
+    else
+        log "INFO" "Docker already restarted, skipping restart in cleanup"
+    fi
 
     log "INFO" "Cleanup completed"
 }
@@ -570,7 +578,7 @@ perform_backup() {
 
     # Show backup summary
     local total_backups=$(borg list "$BACKUP_DIR" | wc -l)
-    local repo_size=$(borg info --json "$BACKUP_DIR" | grep -o '"unique_csize":[0-9]*' | cut -d':' -f2)
+    local repo_size=$(borg info --json "$BACKUP_DIR" | grep '"unique_csize":[0-9]*' | cut -d':' -f2)
     repo_size=$((repo_size / 1024 / 1024)) # Convert to MB
 
     echo -e "${COLOR_CYAN}${COLOR_BOLD}"
