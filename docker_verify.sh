@@ -36,6 +36,7 @@ DEFAULT_BACKUP_DIR="/backup/docker"
 LOG_DIR="/var/log/docker"
 LOG_FILE="${LOG_DIR}/verify.log"
 LOCK_FILE="/var/lock/docker_verify.lock"
+LOCK_TIMEOUT=3600 # 1 hour timeout for lock file
 
 # Color definitions
 COLOR_RESET="\033[0m"
@@ -136,19 +137,48 @@ cleanup_and_exit() {
   exit $exit_code
 }
 
+# Handle termination signals
+handle_signal() {
+  log "WARNING" "Received termination signal. Cleaning up..."
+  cleanup_and_exit 1
+}
+
+# Set up signal handlers
+trap handle_signal SIGINT SIGTERM
+
 # Obtain a lock file to prevent multiple instances
 obtain_lock() {
   log "INFO" "Attempting to obtain lock"
 
   # Check if lock file exists and if process is still running
   if [ -f "$LOCK_FILE" ]; then
-    local pid=$(cat "$LOCK_FILE")
-    if ps -p "$pid" >/dev/null 2>&1; then
-      log "ERROR" "Another verify process is already running (PID: $pid)"
-      echo -e "${COLOR_RED}ERROR: Another verify process is already running (PID: $pid)${COLOR_RESET}"
-      echo -e "${COLOR_YELLOW}If you're sure no other verify is running, remove the lock file:${COLOR_RESET}"
-      echo -e "${COLOR_CYAN}sudo rm -f $LOCK_FILE${COLOR_RESET}"
-      cleanup_and_exit 1
+    local pid=$(cat "$LOCK_FILE" 2>/dev/null)
+    if [[ -z "$pid" ]]; then
+      log "WARNING" "Lock file exists but contains no PID. Removing it."
+      rm -f "$LOCK_FILE"
+    elif ps -p "$pid" >/dev/null 2>&1; then
+      # Check if the process has been running for too long (timeout)
+      if [ -n "$LOCK_TIMEOUT" ]; then
+        local lock_time=$(stat -c %Y "$LOCK_FILE" 2>/dev/null)
+        local current_time=$(date +%s)
+
+        if [ -n "$lock_time" ] && [ $((current_time - lock_time)) -gt $LOCK_TIMEOUT ]; then
+          log "WARNING" "Lock file is older than $LOCK_TIMEOUT seconds. Removing stale lock."
+          rm -f "$LOCK_FILE"
+        else
+          log "ERROR" "Another verify process is already running (PID: $pid)"
+          echo -e "${COLOR_RED}ERROR: Another verify process is already running (PID: $pid)${COLOR_RESET}"
+          echo -e "${COLOR_YELLOW}If you're sure no other verify is running, remove the lock file:${COLOR_RESET}"
+          echo -e "${COLOR_CYAN}sudo rm -f $LOCK_FILE${COLOR_RESET}"
+          cleanup_and_exit 1
+        fi
+      else
+        log "ERROR" "Another verify process is already running (PID: $pid)"
+        echo -e "${COLOR_RED}ERROR: Another verify process is already running (PID: $pid)${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}If you're sure no other verify is running, remove the lock file:${COLOR_RESET}"
+        echo -e "${COLOR_CYAN}sudo rm -f $LOCK_FILE${COLOR_RESET}"
+        cleanup_and_exit 1
+      fi
     else
       log "WARNING" "Stale lock file found. Removing it."
       rm -f "$LOCK_FILE"
@@ -341,10 +371,20 @@ check_repository() {
     if [ "$JSON_OUTPUT" != true ]; then
       echo -e "${COLOR_YELLOW}Repository is encrypted with keyfile. You will be prompted for the passphrase during verification.${COLOR_RESET}"
     fi
+
+    # Verify if BORG_PASSPHRASE is set
+    if [ -n "$BORG_PASSPHRASE" ]; then
+      log "INFO" "Using BORG_PASSPHRASE from environment"
+    fi
   elif echo "$repo_info" | grep -q '"encryption_key"'; then
     log "INFO" "Repository is encrypted with repokey"
     if [ "$JSON_OUTPUT" != true ]; then
       echo -e "${COLOR_YELLOW}Repository is encrypted with repokey. You will be prompted for the passphrase during verification.${COLOR_RESET}"
+    fi
+
+    # Verify if BORG_PASSPHRASE is set
+    if [ -n "$BORG_PASSPHRASE" ]; then
+      log "INFO" "Using BORG_PASSPHRASE from environment"
     fi
   else
     log "INFO" "Repository is not encrypted"
@@ -353,21 +393,82 @@ check_repository() {
 
 # Get list of all archives
 get_archives() {
-  borg list --short "$BACKUP_DIR"
+  local archives=()
+  local result=$(borg list --short "$BACKUP_DIR" 2>/dev/null)
+
+  if [ $? -ne 0 ]; then
+    log "ERROR" "Failed to list archives. Check your repository or passphrase."
+    if [ "$JSON_OUTPUT" = true ]; then
+      echo '{"status":"error","message":"Failed to list archives","error":"Repository access failed"}'
+    else
+      echo -e "${COLOR_RED}ERROR: Failed to list archives. Check your repository or passphrase.${COLOR_RESET}"
+    fi
+    return 1
+  fi
+
+  # Return empty if no archives
+  if [ -z "$result" ]; then
+    return 0
+  fi
+
+  echo "$result"
+  return 0
 }
 
-# Parse JSON from borg
+# Parse JSON from borg with improved error handling
 parse_borg_json() {
   local json_data="$1"
   local field="$2"
 
+  if [ -z "$json_data" ]; then
+    echo "Unknown"
+    return 1
+  fi
+
   # Use jq if available for reliable JSON parsing
   if command_exists jq; then
-    echo "$json_data" | jq -r ".$field"
-  else
-    # Fallback to grep with improved pattern matching
-    echo "$json_data" | grep -o "\"$field\":[[:space:]]*[^,}]*" | sed -E "s/\"$field\":[[:space:]]*(\"[^\"]*\"|[0-9]+|true|false|null)/\1/" | sed 's/^"//;s/"$//'
+    local value
+    value=$(echo "$json_data" | jq -r ".$field" 2>/dev/null)
+    if [ $? -eq 0 ] && [ "$value" != "null" ] && [ -n "$value" ]; then
+      echo "$value"
+      return 0
+    fi
+    echo "Unknown"
+    return 1
   fi
+
+  # Fallback to grep with improved pattern matching
+  # Try different patterns based on the field type
+  if [[ "$field" == *"size"* ]] || [[ "$field" == *"count"* ]]; then
+    # Numeric field
+    local value
+    value=$(echo "$json_data" | grep -o "\"$field\":[[:space:]]*[0-9]*" | grep -o '[0-9]*')
+    if [ -n "$value" ]; then
+      echo "$value"
+      return 0
+    fi
+  elif [[ "$field" == "time" ]]; then
+    # Date/time field (quoted)
+    local value
+    value=$(echo "$json_data" | grep -o "\"$field\":[[:space:]]*\"[^\"]*\"" | grep -o '"[^"]*"$' | tr -d '"')
+    if [ -n "$value" ]; then
+      echo "$value"
+      return 0
+    fi
+  else
+    # Generic field (could be quoted string or other)
+    local value
+    value=$(echo "$json_data" | grep -o "\"$field\":[[:space:]]*[^,}]*" |
+      sed -E "s/\"$field\":[[:space:]]*(\"[^\"]*\"|[0-9]+|true|false|null)/\1/" |
+      sed 's/^"//;s/"$//')
+    if [ -n "$value" ]; then
+      echo "$value"
+      return 0
+    fi
+  fi
+
+  echo "Unknown"
+  return 1
 }
 
 # Format size in human-readable format
@@ -401,18 +502,26 @@ list_archives() {
   log "INFO" "Listing available archives"
 
   # Get list of archives
-  local archives=($(get_archives))
+  local archives_output
+  archives_output=$(get_archives)
+  if [ $? -ne 0 ]; then
+    return 1
+  fi
+
+  local archives=()
+  if [ -n "$archives_output" ]; then
+    readarray -t archives <<<"$archives_output"
+  fi
 
   if [ ${#archives[@]} -eq 0 ]; then
-    log "ERROR" "No archives found in repository"
+    log "WARNING" "No archives found in repository"
 
     if [ "$JSON_OUTPUT" = true ]; then
-      echo '{"status":"error","message":"No archives found in repository","archives":[]}'
-      cleanup_and_exit 1
+      echo '{"status":"success","message":"No archives found in repository","archives":[]}'
     else
-      echo -e "${COLOR_RED}No archives found in repository $BACKUP_DIR${COLOR_RESET}"
-      cleanup_and_exit 1
+      echo -e "${COLOR_YELLOW}No archives found in repository $BACKUP_DIR${COLOR_RESET}"
     fi
+    return 0
   fi
 
   # Output in JSON format if requested
@@ -428,12 +537,35 @@ list_archives() {
         echo -n ','
       fi
 
-      local info=$(borg info --json "$BACKUP_DIR::$archive" 2>/dev/null)
+      local info
+      info=$(borg info --json "$BACKUP_DIR::$archive" 2>/dev/null)
+      if [ $? -ne 0 ]; then
+        # Handle error accessing this specific archive
+        echo -n '{"name":"'$archive'","error":"Failed to get archive info"}'
+        continue
+      fi
+
       local date=$(parse_borg_json "$info" "time")
       local original_size=$(parse_borg_json "$info" "original_size")
       local compressed_size=$(parse_borg_json "$info" "compressed_size")
 
-      echo -n '{"name":"'$archive'","date":"'$date'","original_size":'$original_size',"compressed_size":'$compressed_size'}'
+      echo -n '{"name":"'$archive'","date":"'$date'","original_size":'
+
+      if [ "$original_size" = "Unknown" ]; then
+        echo -n '"Unknown"'
+      else
+        echo -n $original_size
+      fi
+
+      echo -n ',"compressed_size":'
+
+      if [ "$compressed_size" = "Unknown" ]; then
+        echo -n '"Unknown"'
+      else
+        echo -n $compressed_size
+      fi
+
+      echo -n '}'
     done
 
     echo ']}'
@@ -446,8 +578,19 @@ list_archives() {
 
   # Print archives with details
   for archive in "${archives[@]}"; do
-    local info=$(borg info --json "$BACKUP_DIR::$archive" 2>/dev/null)
-    local date=$(parse_borg_json "$info" "time" | cut -d'.' -f1 | sed 's/T/ /')
+    local info
+    info=$(borg info --json "$BACKUP_DIR::$archive" 2>/dev/null)
+    if [ $? -ne 0 ]; then
+      echo -e "  ${COLOR_YELLOW}*${COLOR_RESET} ${COLOR_GREEN}$archive${COLOR_RESET} ${COLOR_RED}(Error: Could not access archive info)${COLOR_RESET}"
+      continue
+    fi
+
+    local date=$(parse_borg_json "$info" "time")
+    # Format date for better readability
+    if [ "$date" != "Unknown" ]; then
+      date=$(echo "$date" | cut -d'.' -f1 | sed 's/T/ /')
+    fi
+
     local original_size=$(parse_borg_json "$info" "original_size")
     local compressed_size=$(parse_borg_json "$info" "compressed_size")
 
@@ -462,6 +605,7 @@ list_archives() {
 
   echo ""
   log "INFO" "Total archives: ${#archives[@]}"
+  return 0
 }
 
 # Verify repository integrity
@@ -474,13 +618,14 @@ verify_repository() {
 
   local start_time=$(date +%s)
 
-  # Capture the output for JSON mode
-  if [ "$JSON_OUTPUT" = true ]; then
-    local output=$(borg check --repository-only "$BACKUP_DIR" 2>&1)
-    local check_result=$?
-  else
-    borg check --repository-only --progress "$BACKUP_DIR"
-    local check_result=$?
+  # Capture the output for JSON mode and error analysis
+  local output
+  output=$(borg check --repository-only "$BACKUP_DIR" 2>&1)
+  local check_result=$?
+
+  if [ "$JSON_OUTPUT" != true ]; then
+    # Print the output for the user
+    echo "$output"
   fi
 
   local end_time=$(date +%s)
@@ -505,6 +650,13 @@ verify_repository() {
       echo '{"status":"error","operation":"repository_check","duration_seconds":'$duration',"result":"fail","exit_code":'$check_result',"output":"'"$output"'"}'
     else
       echo -e "${COLOR_RED}${COLOR_BOLD}Repository integrity check failed!${COLOR_RESET}"
+
+      # Try to extract and show the error message
+      local error_msg
+      error_msg=$(echo "$output" | grep -i "error" | head -1)
+      if [ -n "$error_msg" ]; then
+        echo -e "${COLOR_RED}Error: $error_msg${COLOR_RESET}"
+      fi
     fi
 
     return $check_result
@@ -542,13 +694,14 @@ verify_archive() {
     log "INFO" "Verifying only path: $SPECIFIC_PATH"
   fi
 
-  # Capture the output for JSON mode
-  if [ "$JSON_OUTPUT" = true ]; then
-    local output=$(borg check "$BACKUP_DIR::$archive" $path_args 2>&1)
-    local check_result=$?
-  else
-    borg check --progress "$BACKUP_DIR::$archive" $path_args
-    local check_result=$?
+  # Capture the output for JSON mode and error analysis
+  local output
+  output=$(borg check "$BACKUP_DIR::$archive" $path_args 2>&1)
+  local check_result=$?
+
+  if [ "$JSON_OUTPUT" != true ]; then
+    # Print the output for the user
+    echo "$output"
   fi
 
   local end_time=$(date +%s)
@@ -573,6 +726,13 @@ verify_archive() {
       echo '{"status":"error","operation":"archive_check","archive":"'$archive'","duration_seconds":'$duration',"result":"fail","exit_code":'$check_result',"output":"'"$output"'"}'
     else
       echo -e "${COLOR_RED}${COLOR_BOLD}Archive $archive integrity check failed!${COLOR_RESET}"
+
+      # Try to extract and show the error message
+      local error_msg
+      error_msg=$(echo "$output" | grep -i "error" | head -1)
+      if [ -n "$error_msg" ]; then
+        echo -e "${COLOR_RED}Error: $error_msg${COLOR_RESET}"
+      fi
     fi
 
     return $check_result
@@ -588,18 +748,27 @@ verify_all_archives() {
   fi
 
   # Get list of archives
-  local archives=($(get_archives))
+  local archives_output
+  archives_output=$(get_archives)
+  if [ $? -ne 0 ]; then
+    return 1
+  fi
+
+  local archives=()
+  if [ -n "$archives_output" ]; then
+    readarray -t archives <<<"$archives_output"
+  fi
 
   if [ ${#archives[@]} -eq 0 ]; then
-    log "ERROR" "No archives found in repository"
+    log "WARNING" "No archives found in repository"
 
     if [ "$JSON_OUTPUT" = true ]; then
-      echo '{"status":"error","operation":"verify_all","error":"No archives found in repository","archives":[]}'
+      echo '{"status":"success","operation":"verify_all","message":"No archives found in repository","archives":[]}'
     else
-      echo -e "${COLOR_RED}No archives found in repository $BACKUP_DIR${COLOR_RESET}"
+      echo -e "${COLOR_YELLOW}No archives found in repository $BACKUP_DIR${COLOR_RESET}"
     fi
 
-    return 1
+    return 0
   fi
 
   local total=${#archives[@]}
@@ -623,13 +792,18 @@ verify_all_archives() {
       path_args="$SPECIFIC_PATH"
     fi
 
-    # Capture the output for JSON mode
-    if [ "$JSON_OUTPUT" = true ]; then
-      local output=$(borg check "$BACKUP_DIR::$archive" $path_args 2>&1)
-      local check_result=$?
-    else
-      borg check --progress "$BACKUP_DIR::$archive" $path_args
-      local check_result=$?
+    # Capture the output for JSON mode and error analysis
+    local output
+    output=$(borg check "$BACKUP_DIR::$archive" $path_args 2>&1)
+    local check_result=$?
+
+    if [ "$JSON_OUTPUT" != true ]; then
+      # Print a summary of the output for the user (not the full output to avoid clutter)
+      if [ $check_result -eq 0 ]; then
+        echo -e "${COLOR_GREEN}Completed verification without errors${COLOR_RESET}"
+      else
+        echo "$output" | grep -i "error"
+      fi
     fi
 
     local end_time=$(date +%s)
@@ -641,8 +815,9 @@ verify_all_archives() {
         results+=('{"archive":"'$archive'","result":"pass","duration_seconds":'$duration'}')
       else
         # Escape any double quotes in the output
-        output=$(echo "$output" | sed 's/"/\\"/g')
-        results+=('{"archive":"'$archive'","result":"fail","exit_code":'$check_result',"duration_seconds":'$duration',"output":"'"$output"'"}')
+        local error_output
+        error_output=$(echo "$output" | grep -i "error" | head -1 | sed 's/"/\\"/g')
+        results+=('{"archive":"'$archive'","result":"fail","exit_code":'$check_result',"duration_seconds":'$duration',"error":"'"$error_output"'"}')
       fi
     fi
 
@@ -756,6 +931,9 @@ main() {
     cleanup_and_exit $verify_result
   fi
 }
+
+# Register trap for cleanup
+trap handle_signal EXIT INT TERM
 
 # Ensure log directory exists
 ensure_log_directory

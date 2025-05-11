@@ -36,6 +36,7 @@ DEFAULT_BACKUP_DIR="/backup/docker"
 LOG_DIR="/var/log/docker"
 LOG_FILE="${LOG_DIR}/cleanup.log"
 LOCK_FILE="/var/lock/docker_cleanup.lock"
+LOCK_TIMEOUT=3600 # 1 hour timeout for lock file
 DOCKER_COMPOSE_FILES=()
 
 # Color definitions
@@ -199,19 +200,48 @@ cleanup_and_exit() {
     exit $exit_code
 }
 
+# Handle termination signals
+handle_signal() {
+    log "WARNING" "Received termination signal. Cleaning up..."
+    cleanup_and_exit 1
+}
+
+# Set up signal handlers
+trap handle_signal SIGINT SIGTERM
+
 # Obtain a lock file to prevent multiple instances
 obtain_lock() {
     log "INFO" "Attempting to obtain lock"
 
     # Check if lock file exists and if process is still running
     if [ -f "$LOCK_FILE" ]; then
-        local pid=$(cat "$LOCK_FILE")
-        if ps -p "$pid" >/dev/null 2>&1; then
-            log "ERROR" "Another cleanup process is already running (PID: $pid)"
-            echo -e "${COLOR_RED}ERROR: Another cleanup process is already running (PID: $pid)${COLOR_RESET}"
-            echo -e "${COLOR_YELLOW}If you're sure no other cleanup is running, remove the lock file:${COLOR_RESET}"
-            echo -e "${COLOR_CYAN}sudo rm -f $LOCK_FILE${COLOR_RESET}"
-            cleanup_and_exit 1
+        local pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [[ -z "$pid" ]]; then
+            log "WARNING" "Lock file exists but contains no PID. Removing it."
+            rm -f "$LOCK_FILE"
+        elif ps -p "$pid" >/dev/null 2>&1; then
+            # Check if the process has been running for too long (timeout)
+            if [ -n "$LOCK_TIMEOUT" ]; then
+                local lock_time=$(stat -c %Y "$LOCK_FILE" 2>/dev/null)
+                local current_time=$(date +%s)
+
+                if [ -n "$lock_time" ] && [ $((current_time - lock_time)) -gt $LOCK_TIMEOUT ]; then
+                    log "WARNING" "Lock file is older than $LOCK_TIMEOUT seconds. Removing stale lock."
+                    rm -f "$LOCK_FILE"
+                else
+                    log "ERROR" "Another cleanup process is already running (PID: $pid)"
+                    echo -e "${COLOR_RED}ERROR: Another cleanup process is already running (PID: $pid)${COLOR_RESET}"
+                    echo -e "${COLOR_YELLOW}If you're sure no other cleanup is running, remove the lock file:${COLOR_RESET}"
+                    echo -e "${COLOR_CYAN}sudo rm -f $LOCK_FILE${COLOR_RESET}"
+                    cleanup_and_exit 1
+                fi
+            else
+                log "ERROR" "Another cleanup process is already running (PID: $pid)"
+                echo -e "${COLOR_RED}ERROR: Another cleanup process is already running (PID: $pid)${COLOR_RESET}"
+                echo -e "${COLOR_YELLOW}If you're sure no other cleanup is running, remove the lock file:${COLOR_RESET}"
+                echo -e "${COLOR_CYAN}sudo rm -f $LOCK_FILE${COLOR_RESET}"
+                cleanup_and_exit 1
+            fi
         else
             log "WARNING" "Stale lock file found. Removing it."
             rm -f "$LOCK_FILE"
@@ -394,9 +424,19 @@ check_borg_installation() {
         if echo "$repo_info" | grep -q '"encryption_keyfile"'; then
             log "INFO" "Repository is encrypted with keyfile"
             echo -e "${COLOR_YELLOW}Repository is encrypted with keyfile. You will be prompted for the passphrase during operations.${COLOR_RESET}"
+
+            # Verify if BORG_PASSPHRASE is set
+            if [ -n "$BORG_PASSPHRASE" ]; then
+                log "INFO" "Using BORG_PASSPHRASE from environment"
+            fi
         elif echo "$repo_info" | grep -q '"encryption_key"'; then
             log "INFO" "Repository is encrypted with repokey"
             echo -e "${COLOR_YELLOW}Repository is encrypted with repokey. You will be prompted for the passphrase during operations.${COLOR_RESET}"
+
+            # Verify if BORG_PASSPHRASE is set
+            if [ -n "$BORG_PASSPHRASE" ]; then
+                log "INFO" "Using BORG_PASSPHRASE from environment"
+            fi
         else
             log "INFO" "Repository is not encrypted"
         fi
@@ -454,12 +494,29 @@ parse_docker_compose_files() {
         )
 
         for location in "${common_locations[@]}"; do
-            for file in $(find ${location%/*} -name "${location##*/}" 2>/dev/null); do
-                if [ -f "$file" ]; then
-                    log "INFO" "Found compose file: $file"
-                    DOCKER_COMPOSE_FILES+=("$file")
+            # Handle wildcard paths correctly
+            if [[ "$location" == *"*"* ]]; then
+                # Extract the base path before the wildcard
+                local base_path="${location%/*}"
+                # Extract the filename pattern after the last /
+                local file_pattern="${location##*/}"
+
+                # Use find to locate matching files
+                if [ -d "$base_path" ]; then
+                    while IFS= read -r file; do
+                        if [ -f "$file" ]; then
+                            log "INFO" "Found compose file: $file"
+                            DOCKER_COMPOSE_FILES+=("$file")
+                        fi
+                    done < <(find "$base_path" -name "$file_pattern" 2>/dev/null)
                 fi
-            done
+            else
+                # Direct file check
+                if [ -f "$location" ]; then
+                    log "INFO" "Found compose file: $location"
+                    DOCKER_COMPOSE_FILES+=("$location")
+                fi
+            fi
         done
     fi
 
@@ -467,44 +524,209 @@ parse_docker_compose_files() {
     for compose_file in "${DOCKER_COMPOSE_FILES[@]}"; do
         log "INFO" "Parsing compose file: $compose_file"
 
-        # Extract volumes (both named and anonymous)
-        if grep -q "volumes:" "$compose_file"; then
-            local file_volumes=$(grep -A50 "volumes:" "$compose_file" | grep -v "^volumes:" | grep -v "^[[:space:]]*#" | grep -v "^[[:space:]]*$" | grep -v "^[[:space:]]*-" | sed -n '/^[[:space:]]*[a-zA-Z0-9_.-]*:/,/^[a-zA-Z0-9_-]*:/p' | grep -v "^[a-zA-Z0-9_-]*:" | grep -v "driver:" | awk '{print $1}' | tr -d ':' | tr -d ' ' | grep -v "^$")
+        # Check if the file is valid YAML before attempting to parse it
+        if command_exists python3; then
+            if ! python3 -c "import yaml; yaml.safe_load(open('$compose_file'))" 2>/dev/null; then
+                log "WARNING" "File $compose_file does not appear to be valid YAML, skipping"
+                continue
+            fi
+        fi
 
-            for vol in $file_volumes; do
-                compose_volumes+=("$vol")
-                log "INFO" "Found volume in compose file: $vol"
-            done
+        # Try to use yq if available for more reliable YAML parsing
+        if command_exists yq; then
+            log "INFO" "Using yq for compose file parsing"
 
-            # Also check for volumes in service definitions
-            local service_volumes=$(grep -A3 "  volumes:" "$compose_file" | grep -v "volumes:" | grep -v "^[[:space:]]*#" | grep -v "^[[:space:]]*$" | grep -v "^[[:space:]]*-" | grep -v "driver:" | awk -F: '{print $1}' | tr -d ' ' | grep -v "^$")
+            # Get volumes from top-level volumes definition
+            local volumes_output
+            volumes_output=$(yq e '.volumes | keys' "$compose_file" 2>/dev/null)
+            if [ $? -eq 0 ]; then
+                while IFS= read -r volume; do
+                    if [ -n "$volume" ] && [ "$volume" != "null" ]; then
+                        compose_volumes+=("$volume")
+                        log "INFO" "Found volume in compose file: $volume"
+                    fi
+                done <<<"$volumes_output"
+            fi
 
-            for vol in $service_volumes; do
-                if [[ "$vol" != /* ]] && [[ "$vol" != .* ]]; then
+            # Get volumes from service definitions
+            local services_output
+            services_output=$(yq e '.services | keys' "$compose_file" 2>/dev/null)
+            if [ $? -eq 0 ]; then
+                while IFS= read -r service; do
+                    if [ -n "$service" ] && [ "$service" != "null" ]; then
+                        local service_volumes_output
+                        service_volumes_output=$(yq e ".services.$service.volumes[]" "$compose_file" 2>/dev/null)
+
+                        while IFS= read -r vol; do
+                            if [ -n "$vol" ] && [ "$vol" != "null" ]; then
+                                # Check if it's a named volume (not a bind mount)
+                                if [[ "$vol" != /* ]] && [[ "$vol" != .* ]] && [[ "$vol" == *":"* ]]; then
+                                    local vol_name="${vol%%:*}"
+                                    compose_volumes+=("$vol_name")
+                                    log "INFO" "Found volume in service $service: $vol_name"
+                                fi
+                            fi
+                        done <<<"$service_volumes_output"
+                    fi
+                done <<<"$services_output"
+            fi
+
+            # Get networks
+            local networks_output
+            networks_output=$(yq e '.networks | keys' "$compose_file" 2>/dev/null)
+            if [ $? -eq 0 ]; then
+                while IFS= read -r network; do
+                    if [ -n "$network" ] && [ "$network" != "null" ]; then
+                        compose_networks+=("$network")
+                        log "INFO" "Found network in compose file: $network"
+                    fi
+                done <<<"$networks_output"
+            fi
+
+            # Get images
+            local images_output
+            images_output=$(yq e '.services[].image' "$compose_file" 2>/dev/null)
+            while IFS= read -r image; do
+                if [ -n "$image" ] && [ "$image" != "null" ]; then
+                    compose_images+=("$image")
+                    log "INFO" "Found image in compose file: $image"
+                fi
+            done <<<"$images_output"
+
+        else
+            log "INFO" "Using grep/sed for compose file parsing (less reliable)"
+
+            # Extract volumes (both named and anonymous)
+            if grep -q "volumes:" "$compose_file"; then
+                # Use awk to try to handle indentation better
+                local in_volumes_section=0
+                local indent_level=0
+
+                while IFS= read -r line; do
+                    # Skip empty lines and comments
+                    if [[ -z "$line" ]] || [[ "$line" =~ ^[[:space:]]*# ]]; then
+                        continue
+                    fi
+
+                    # Check for volumes: section at the top level
+                    if [[ "$line" =~ ^volumes: ]]; then
+                        in_volumes_section=1
+                        indent_level=$(echo "$line" | awk '{ match($0, /^[ \t]*/); printf("%d", RLENGTH); }')
+                        continue
+                    fi
+
+                    # Exit volumes section when we hit another top-level key
+                    if [[ $in_volumes_section -eq 1 ]] && [[ "$line" =~ ^[a-zA-Z_-]+ ]]; then
+                        in_volumes_section=0
+                    fi
+
+                    # Process lines within volumes section
+                    if [[ $in_volumes_section -eq 1 ]]; then
+                        # Get line indentation
+                        local line_indent=$(echo "$line" | awk '{ match($0, /^[ \t]*/); printf("%d", RLENGTH); }')
+
+                        # Volume name is one level deeper than 'volumes:'
+                        if [[ $line_indent -gt $indent_level ]] && [[ "$line" =~ ^[[:space:]]+[a-zA-Z0-9_.-]+: ]]; then
+                            local vol=$(echo "$line" | sed -E 's/^[[:space:]]+([a-zA-Z0-9_.-]+):.*/\1/')
+                            compose_volumes+=("$vol")
+                            log "INFO" "Found volume in compose file: $vol"
+                        fi
+                    fi
+                done <"$compose_file"
+
+                # Also check for volumes in service definitions
+                local service_volumes=()
+                while IFS= read -r line; do
+                    if [[ "$line" =~ [[:space:]]+volumes: ]]; then
+                        # Get the indentation of the volumes line
+                        local vol_indent=$(echo "$line" | awk '{ match($0, /^[ \t]*/); printf("%d", RLENGTH); }')
+                        # Read the next lines until we hit a line with less or equal indentation
+                        while IFS= read -r vol_line; do
+                            local line_indent=$(echo "$vol_line" | awk '{ match($0, /^[ \t]*/); printf("%d", RLENGTH); }')
+                            if [[ $line_indent -le $vol_indent ]] && [[ ! "$vol_line" =~ ^[[:space:]]*$ ]] && [[ ! "$vol_line" =~ ^[[:space:]]*# ]]; then
+                                break
+                            fi
+                            # Extract volume if it's in the format name:path
+                            if [[ "$vol_line" =~ [[:space:]]+- ]]; then
+                                local vol_entry=$(echo "$vol_line" | sed -E 's/^[[:space:]]+- //')
+                                # If it's not a bind mount and has a colon
+                                if [[ "$vol_entry" != /* ]] && [[ "$vol_entry" != .* ]] && [[ "$vol_entry" == *":"* ]]; then
+                                    local vol_name="${vol_entry%%:*}"
+                                    if [[ -n "$vol_name" ]]; then
+                                        service_volumes+=("$vol_name")
+                                    fi
+                                fi
+                            fi
+                        done < <(grep -A20 -E "^[[:space:]]+volumes:" "$compose_file" | tail -n +2)
+                    fi
+                done <"$compose_file"
+
+                for vol in "${service_volumes[@]}"; do
                     compose_volumes+=("$vol")
                     log "INFO" "Found volume in service: $vol"
-                fi
+                done
+            fi
+
+            # Extract networks
+            if grep -q "networks:" "$compose_file"; then
+                local in_networks_section=0
+                local indent_level=0
+
+                while IFS= read -r line; do
+                    # Skip empty lines and comments
+                    if [[ -z "$line" ]] || [[ "$line" =~ ^[[:space:]]*# ]]; then
+                        continue
+                    fi
+
+                    # Check for networks: section at the top level
+                    if [[ "$line" =~ ^networks: ]]; then
+                        in_networks_section=1
+                        indent_level=$(echo "$line" | awk '{ match($0, /^[ \t]*/); printf("%d", RLENGTH); }')
+                        continue
+                    fi
+
+                    # Exit networks section when we hit another top-level key
+                    if [[ $in_networks_section -eq 1 ]] && [[ "$line" =~ ^[a-zA-Z_-]+ ]]; then
+                        in_networks_section=0
+                    fi
+
+                    # Process lines within networks section
+                    if [[ $in_networks_section -eq 1 ]]; then
+                        # Get line indentation
+                        local line_indent=$(echo "$line" | awk '{ match($0, /^[ \t]*/); printf("%d", RLENGTH); }')
+
+                        # Network name is one level deeper than 'networks:'
+                        if [[ $line_indent -gt $indent_level ]] && [[ "$line" =~ ^[[:space:]]+[a-zA-Z0-9_.-]+: ]]; then
+                            local net=$(echo "$line" | sed -E 's/^[[:space:]]+([a-zA-Z0-9_.-]+):.*/\1/')
+                            compose_networks+=("$net")
+                            log "INFO" "Found network in compose file: $net"
+                        fi
+                    fi
+                done <"$compose_file"
+            fi
+
+            # Extract images
+            local file_images=$(grep -E "image:[[:space:]]*" "$compose_file" | sed -E 's/[[:space:]]*image:[[:space:]]*//' | tr -d ' ' | tr -d '"' | tr -d "'" | grep -v "^$")
+
+            for img in $file_images; do
+                compose_images+=("$img")
+                log "INFO" "Found image in compose file: $img"
             done
         fi
-
-        # Extract networks
-        if grep -q "networks:" "$compose_file"; then
-            local file_networks=$(grep -A50 "networks:" "$compose_file" | grep -v "^networks:" | grep -v "^[[:space:]]*#" | grep -v "^[[:space:]]*$" | grep -v "^[[:space:]]*-" | sed -n '/^[[:space:]]*[a-zA-Z0-9_.-]*:/,/^[a-zA-Z0-9_-]*:/p' | grep -v "^[a-zA-Z0-9_-]*:" | grep -v "driver:" | awk '{print $1}' | tr -d ':' | tr -d ' ' | grep -v "^$")
-
-            for net in $file_networks; do
-                compose_networks+=("$net")
-                log "INFO" "Found network in compose file: $net"
-            done
-        fi
-
-        # Extract images
-        local file_images=$(grep -E "image:[[:space:]]*" "$compose_file" | sed -E 's/[[:space:]]*image:[[:space:]]*//' | tr -d ' ' | tr -d '"' | tr -d "'" | grep -v "^$")
-
-        for img in $file_images; do
-            compose_images+=("$img")
-            log "INFO" "Found image in compose file: $img"
-        done
     done
+
+    # Deduplicate results
+    if [ ${#compose_volumes[@]} -gt 0 ]; then
+        compose_volumes=($(echo "${compose_volumes[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+    fi
+
+    if [ ${#compose_networks[@]} -gt 0 ]; then
+        compose_networks=($(echo "${compose_networks[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+    fi
+
+    if [ ${#compose_images[@]} -gt 0 ]; then
+        compose_images=($(echo "${compose_images[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+    fi
 
     # Return the arrays of resources
     echo "${compose_volumes[@]}"
@@ -536,8 +758,11 @@ clean_volumes() {
     # Get volumes used in Docker Compose files if smart cleanup is enabled
     local compose_volumes=()
     if [ "$SMART_CLEANUP" = true ]; then
-        readarray -t compose_volumes < <(parse_docker_compose_files | head -1)
-        log "INFO" "Found ${#compose_volumes[@]} volumes in Docker Compose files"
+        local compose_resources=$(parse_docker_compose_files)
+        if [ -n "$compose_resources" ]; then
+            readarray -t compose_volumes < <(echo "$compose_resources" | head -1)
+            log "INFO" "Found ${#compose_volumes[@]} volumes in Docker Compose files"
+        fi
     fi
 
     # Find unused volumes
@@ -876,8 +1101,11 @@ clean_networks() {
     # Get networks used in Docker Compose files if smart cleanup is enabled
     local compose_networks=()
     if [ "$SMART_CLEANUP" = true ]; then
-        readarray -t compose_networks < <(parse_docker_compose_files | sed -n '2p')
-        log "INFO" "Found ${#compose_networks[@]} networks in Docker Compose files"
+        local compose_resources=$(parse_docker_compose_files)
+        if [ -n "$compose_resources" ]; then
+            readarray -t compose_networks < <(echo "$compose_resources" | sed -n '2p')
+            log "INFO" "Found ${#compose_networks[@]} networks in Docker Compose files"
+        fi
     fi
 
     # Find unused networks
@@ -1143,6 +1371,22 @@ clean_borg() {
     log "INFO" "Checking for stale locks..."
     borg break-lock "$BACKUP_DIR" 2>/dev/null
 
+    # Verify repository integrity before compaction
+    log "INFO" "Checking repository integrity before compaction..."
+
+    if ! borg check --repository-only "$BACKUP_DIR" >/dev/null 2>&1; then
+        log "ERROR" "Repository integrity check failed, cannot proceed with compaction"
+
+        if [ "$JSON_OUTPUT" = true ]; then
+            echo '{"operation":"clean_borg","status":"error","message":"Repository integrity check failed, cannot proceed with compaction"}'
+        else
+            echo -e "${COLOR_RED}ERROR: Repository integrity check failed, cannot proceed with compaction${COLOR_RESET}"
+            echo -e "${COLOR_YELLOW}Try running 'docker_verify' first to diagnose issues.${COLOR_RESET}"
+        fi
+
+        return 1
+    fi
+
     # Compact the repository
     log "INFO" "Compacting repository (this may take a while)..."
 
@@ -1176,8 +1420,12 @@ clean_borg() {
 
         if [ "$JSON_OUTPUT" = true ]; then
             # Escape output for JSON
-            output=$(echo "$output" | sed 's/"/\\"/g')
-            echo '{"operation":"clean_borg","status":"error","exit_code":'$compact_result',"duration_seconds":'$duration',"output":"'"$output"'"}'
+            if [ -n "$output" ]; then
+                output=$(echo "$output" | sed 's/"/\\"/g')
+                echo '{"operation":"clean_borg","status":"error","exit_code":'$compact_result',"duration_seconds":'$duration',"output":"'"$output"'"}'
+            else
+                echo '{"operation":"clean_borg","status":"error","exit_code":'$compact_result',"duration_seconds":'$duration'}'
+            fi
         else
             echo -e "${COLOR_RED}Repository compaction failed${COLOR_RESET}"
         fi
@@ -1198,7 +1446,20 @@ clean_old_backups() {
     fi
 
     # Check how many backups would be affected
-    local dry_run_output=$(borg prune --dry-run --keep-within ${days}d --list "$BACKUP_DIR" 2>&1)
+    local dry_run_output
+    dry_run_output=$(borg prune --dry-run --keep-within ${days}d --list "$BACKUP_DIR" 2>&1)
+    local dry_run_result=$?
+
+    if [ $dry_run_result -ne 0 ]; then
+        log "ERROR" "Failed to check for old backups"
+        if [ "$JSON_OUTPUT" = true ]; then
+            echo '{"operation":"clean_old_backups","days":'$days',"status":"error","message":"Failed to check for old backups","error":"Borg dry run failed"}'
+        else
+            echo -e "${COLOR_RED}ERROR: Failed to check for old backups${COLOR_RESET}"
+        fi
+        return 1
+    fi
+
     local affected_count=$(echo "$dry_run_output" | grep -c "Would prune:")
 
     if [ $affected_count -eq 0 ]; then
@@ -1214,7 +1475,12 @@ clean_old_backups() {
     fi
 
     # Get the list of affected archives
-    local affected_archives=($(echo "$dry_run_output" | grep "Would prune:" | sed 's/Would prune: //'))
+    local affected_archives=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ Would\ prune:\ (.+) ]]; then
+            affected_archives+=("${BASH_REMATCH[1]}")
+        fi
+    done <<<"$dry_run_output"
 
     if [ "$JSON_OUTPUT" != true ]; then
         echo -e "${COLOR_CYAN}Found $affected_count backups older than $days days:${COLOR_RESET}"
@@ -1270,14 +1536,23 @@ clean_old_backups() {
             echo '{"operation":"clean_old_backups","days":'$days',"status":"success","removed":'$affected_count',"duration_seconds":'$duration'}'
         else
             echo -e "${COLOR_GREEN}Successfully pruned backups older than $days days (removed $affected_count archives)${COLOR_RESET}"
+
+            # Suggest compacting repository if not already done
+            if [ "$CLEAN_BORG" != true ]; then
+                echo -e "${COLOR_YELLOW}Note: To reclaim disk space, consider running with --borg to compact the repository.${COLOR_RESET}"
+            fi
         fi
     else
         log "ERROR" "Failed to prune old backups with exit code $prune_result"
 
         if [ "$JSON_OUTPUT" = true ]; then
             # Escape output for JSON
-            output=$(echo "$output" | sed 's/"/\\"/g')
-            echo '{"operation":"clean_old_backups","days":'$days',"status":"error","exit_code":'$prune_result',"duration_seconds":'$duration',"output":"'"$output"'"}'
+            if [ -n "$output" ]; then
+                output=$(echo "$output" | sed 's/"/\\"/g')
+                echo '{"operation":"clean_old_backups","days":'$days',"status":"error","exit_code":'$prune_result',"duration_seconds":'$duration',"output":"'"$output"'"}'
+            else
+                echo '{"operation":"clean_old_backups","days":'$days',"status":"error","exit_code":'$prune_result',"duration_seconds":'$duration'}'
+            fi
         else
             echo -e "${COLOR_RED}Failed to prune old backups${COLOR_RESET}"
         fi
@@ -1297,7 +1572,21 @@ clean_all_borg() {
     fi
 
     # Get count of archives for reporting
-    local archives=($(borg list --short "$BACKUP_DIR"))
+    local archives
+    local archive_list
+    archive_list=$(borg list --short "$BACKUP_DIR" 2>/dev/null)
+
+    if [ $? -ne 0 ]; then
+        log "ERROR" "Failed to list archives in repository"
+        if [ "$JSON_OUTPUT" = true ]; then
+            echo '{"operation":"clean_all_borg","status":"error","message":"Failed to list archives in repository"}'
+        else
+            echo -e "${COLOR_RED}ERROR: Failed to list archives in repository${COLOR_RESET}"
+        fi
+        return 1
+    fi
+
+    readarray -t archives <<<"$archive_list"
     local archive_count=${#archives[@]}
 
     if [ $archive_count -eq 0 ]; then
@@ -1359,7 +1648,7 @@ clean_all_borg() {
     log "INFO" "Removing ALL $archive_count Borg backups..."
     local start_time=$(date +%s)
 
-    # First remove all the archives
+    # First remove all the archives using prune with keep-nothing
     if [ "$JSON_OUTPUT" = true ]; then
         local output=$(borg prune --stats --keep-within 0d "$BACKUP_DIR" 2>&1)
         local prune_result=$?
@@ -1407,8 +1696,12 @@ clean_all_borg() {
 
         if [ "$JSON_OUTPUT" = true ]; then
             # Escape output for JSON
-            output=$(echo "$output" | sed 's/"/\\"/g')
-            echo '{"operation":"clean_all_borg","status":"error","exit_code":'$prune_result',"duration_seconds":'$duration',"output":"'"$output"'"}'
+            if [ -n "$output" ]; then
+                output=$(echo "$output" | sed 's/"/\\"/g')
+                echo '{"operation":"clean_all_borg","status":"error","exit_code":'$prune_result',"duration_seconds":'$duration',"output":"'"$output"'"}'
+            else
+                echo '{"operation":"clean_all_borg","status":"error","exit_code":'$prune_result',"duration_seconds":'$duration'}'
+            fi
         else
             echo -e "${COLOR_RED}Failed to remove all backups${COLOR_RESET}"
         fi
@@ -1485,6 +1778,9 @@ run_system_prune() {
     else
         docker system prune --all --volumes --force
         local prune_result=$?
+
+        # Try to extract the amount of space reclaimed
+        local total_reclaimed=$(docker system df --format '{{json .}}' | grep -o '"TotalSize":"[^"]*"' | cut -d'"' -f4)
     fi
 
     local end_time=$(date +%s)
@@ -1497,14 +1793,21 @@ run_system_prune() {
             echo '{"operation":"system_prune","status":"success","duration_seconds":'$duration',"space_freed":"'$total_reclaimed'"}'
         else
             echo -e "${COLOR_GREEN}System prune completed successfully${COLOR_RESET}"
+            if [ -n "$total_reclaimed" ]; then
+                echo -e "${COLOR_GREEN}Total space reclaimed: $total_reclaimed${COLOR_RESET}"
+            fi
         fi
     else
         log "ERROR" "System prune failed with exit code $prune_result"
 
         if [ "$JSON_OUTPUT" = true ]; then
             # Escape output for JSON
-            output=$(echo "$output" | sed 's/"/\\"/g')
-            echo '{"operation":"system_prune","status":"error","exit_code":'$prune_result',"duration_seconds":'$duration',"output":"'"$output"'"}'
+            if [ -n "$output" ]; then
+                output=$(echo "$output" | sed 's/"/\\"/g')
+                echo '{"operation":"system_prune","status":"error","exit_code":'$prune_result',"duration_seconds":'$duration',"output":"'"$output"'"}'
+            else
+                echo '{"operation":"system_prune","status":"error","exit_code":'$prune_result',"duration_seconds":'$duration'}'
+            fi
         else
             echo -e "${COLOR_RED}System prune failed${COLOR_RESET}"
         fi
@@ -1517,7 +1820,30 @@ run_system_prune() {
 parse_json_value() {
     local json="$1"
     local key="$2"
-    echo "$json" | grep -o "\"$key\":\"[^\"]*\"" | cut -d':' -f2 | tr -d '"'
+
+    if [ -z "$json" ]; then
+        echo "Unknown"
+        return 1
+    fi
+
+    # Use jq if available
+    if command_exists jq; then
+        local value
+        value=$(echo "$json" | jq -r ".$key" 2>/dev/null)
+        if [ $? -eq 0 ] && [ "$value" != "null" ] && [ -n "$value" ]; then
+            echo "$value"
+            return 0
+        fi
+    fi
+
+    # Fallback to grep/sed
+    local value
+    value=$(echo "$json" | grep -o "\"$key\":\"[^\"]*\"" | cut -d':' -f2 | tr -d '"')
+    if [ -n "$value" ]; then
+        echo "$value"
+    else
+        echo "Unknown"
+    fi
 }
 
 # Display system information
@@ -1529,62 +1855,87 @@ show_system_information() {
         local system_info="{"
 
         # Docker version info
-        local docker_version_json=$(docker version --format '{{json .}}')
-        local client_version=$(parse_json_value "$docker_version_json" "Version")
-        local server_version=$(parse_json_value "$docker_version_json" "Version")
+        local docker_version_json
+        docker_version_json=$(docker version --format '{{json .}}' 2>/dev/null)
+        local client_version
+        local server_version
+
+        if [ $? -eq 0 ] && [ -n "$docker_version_json" ]; then
+            client_version=$(parse_json_value "$docker_version_json" "Version")
+            server_version=$(parse_json_value "$docker_version_json" "Version")
+        else
+            # Fallback if --format not supported
+            client_version=$(docker version | grep -A2 "Client:" | grep "Version:" | sed 's/.*Version:[[:space:]]*//')
+            server_version=$(docker version | grep -A2 "Server:" | grep "Version:" | sed 's/.*Version:[[:space:]]*//')
+        fi
 
         system_info+='"docker":{"client_version":"'$client_version'","server_version":"'$server_version'"},'
 
-        # System disk usage
-        local system_df=$(docker system df --format '{{json .}}')
+        # System disk usage - handle potential Docker System API errors gracefully
+        local system_df
+        system_df=$(docker system df --format '{{json .}}' 2>/dev/null)
+        if [ $? -eq 0 ] && [ -n "$system_df" ]; then
+            system_info+='"disk_usage":'$system_df','
+        else
+            system_info+='"disk_usage":{"error":"Could not retrieve system disk usage"},'
+        fi
 
-        system_info+='"disk_usage":'$system_df','
-
-        # Current resources
-        local images_count=$(docker images -q | wc -l)
-        local containers_all=$(docker ps -a -q | wc -l)
-        local containers_running=$(docker ps -q | wc -l)
-        local volumes_count=$(docker volume ls -q | wc -l)
-        local networks_count=$(docker network ls -q | wc -l)
+        # Current resources - count safely with || true to handle errors
+        local images_count=$(docker images -q | wc -l || echo "0")
+        local containers_all=$(docker ps -a -q | wc -l || echo "0")
+        local containers_running=$(docker ps -q | wc -l || echo "0")
+        local volumes_count=$(docker volume ls -q | wc -l || echo "0")
+        local networks_count=$(docker network ls -q | wc -l || echo "0")
 
         system_info+='"resources":{"images":'$images_count',"containers_all":'$containers_all',"containers_running":'$containers_running',"volumes":'$volumes_count',"networks":'$networks_count'},'
 
         # Borg repository info if available
         if command_exists borg && borg info "$BACKUP_DIR" >/dev/null 2>&1; then
-            local archive_count=$(borg list --short "$BACKUP_DIR" | wc -l)
+            local archive_count=$(borg list --short "$BACKUP_DIR" 2>/dev/null | wc -l)
             local repo_info=$(borg info --json "$BACKUP_DIR" 2>/dev/null)
 
-            system_info+='"borg_repository":{"path":"'$BACKUP_DIR'","archives":'$archive_count','
+            if [ -n "$repo_info" ]; then
+                system_info+='"borg_repository":{"path":"'$BACKUP_DIR'","archives":'$archive_count','
 
-            # Get repository size info
-            local total_size=$(echo "$repo_info" | grep -o '"total_size":[0-9]*' | cut -d':' -f2)
-            local total_unique=$(echo "$repo_info" | grep -o '"unique_size":[0-9]*' | cut -d':' -f2)
+                # Get repository size info
+                local total_size=$(echo "$repo_info" | grep -o '"total_size":[0-9]*' | grep -o '[0-9]*')
+                local total_unique=$(echo "$repo_info" | grep -o '"unique_size":[0-9]*' | grep -o '[0-9]*')
 
-            if [ -n "$total_size" ] && [ -n "$total_unique" ]; then
-                # Convert to MB
-                total_size=$(echo "scale=2; $total_size/1024/1024" | bc)
-                total_unique=$(echo "scale=2; $total_unique/1024/1024" | bc)
+                if [ -n "$total_size" ] && [ -n "$total_unique" ]; then
+                    # Convert to MB
+                    total_size=$(echo "scale=2; $total_size/1024/1024" | bc)
+                    total_unique=$(echo "scale=2; $total_unique/1024/1024" | bc)
 
-                system_info+='"total_size_mb":'$total_size',"unique_data_mb":'$total_unique
+                    system_info+='"total_size_mb":'$total_size',"unique_data_mb":'$total_unique
 
-                # Calculate deduplication ratio if possible
-                if [ "$(echo "$total_unique > 0" | bc)" -eq 1 ]; then
-                    local dedup_ratio=$(echo "scale=2; $total_size / $total_unique" | bc)
-                    system_info+=',"deduplication_ratio":'$dedup_ratio
+                    # Calculate deduplication ratio if possible
+                    if [ "$(echo "$total_unique > 0" | bc)" -eq 1 ]; then
+                        local dedup_ratio=$(echo "scale=2; $total_size / $total_unique" | bc)
+                        system_info+=',"deduplication_ratio":'$dedup_ratio
+                    fi
                 fi
-            fi
 
-            system_info+='},'
+                system_info+='},'
+            else
+                system_info+='"borg_repository":{"path":"'$BACKUP_DIR'","archives":'$archive_count',"error":"Could not retrieve repository info"},'
+            fi
         fi
 
         # Host disk usage
         if command -v df >/dev/null 2>&1; then
-            local docker_root=$(docker info --format '{{.DockerRootDir}}' | cut -d':' -f1)
-            local df_output=$(df -h "$docker_root" | awk 'NR==2 {print $1","$2","$3","$4","$5","$6}')
-            local IFS=','
-            read -ra df_fields <<<"$df_output"
+            local docker_root
+            docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo "/var/lib/docker")
+            local df_output
+            df_output=$(df -h "$docker_root" | awk 'NR==2 {print $1","$2","$3","$4","$5","$6}')
 
-            system_info+='"host_disk_usage":{"filesystem":"'${df_fields[0]}'","size":"'${df_fields[1]}'","used":"'${df_fields[2]}'","available":"'${df_fields[3]}'","use_percent":"'${df_fields[4]}'","mounted_on":"'${df_fields[5]}'"}'
+            if [ -n "$df_output" ]; then
+                local IFS=','
+                read -ra df_fields <<<"$df_output"
+
+                system_info+='"host_disk_usage":{"filesystem":"'${df_fields[0]}'","size":"'${df_fields[1]}'","used":"'${df_fields[2]}'","available":"'${df_fields[3]}'","use_percent":"'${df_fields[4]}'","mounted_on":"'${df_fields[5]}'"}'
+            else
+                system_info+='"host_disk_usage":{"error":"Could not retrieve host disk usage"}'
+            fi
         fi
 
         system_info+="}"
@@ -1598,12 +1949,16 @@ show_system_information() {
 
         # Docker version info
         echo -e "${COLOR_BLUE}Docker Version:${COLOR_RESET}"
-        docker version --format "Client: ${COLOR_GREEN}{{.Client.Version}}${COLOR_RESET}, Server: ${COLOR_GREEN}{{.Server.Version}}${COLOR_RESET}"
+        docker version --format "Client: ${COLOR_GREEN}{{.Client.Version}}${COLOR_RESET}, Server: ${COLOR_GREEN}{{.Server.Version}}${COLOR_RESET}" 2>/dev/null || {
+            local client_ver=$(docker version | grep -A2 "Client:" | grep "Version:" | sed 's/.*Version:[[:space:]]*//')
+            local server_ver=$(docker version | grep -A2 "Server:" | grep "Version:" | sed 's/.*Version:[[:space:]]*//')
+            echo -e "Client: ${COLOR_GREEN}$client_ver${COLOR_RESET}, Server: ${COLOR_GREEN}$server_ver${COLOR_RESET}"
+        }
 
         # System disk usage
         echo ""
         echo -e "${COLOR_BLUE}Docker Disk Usage Summary:${COLOR_RESET}"
-        docker system df
+        docker system df 2>/dev/null || echo -e "${COLOR_YELLOW}  Could not retrieve disk usage information${COLOR_RESET}"
 
         # Current resources
         echo ""
@@ -1620,15 +1975,15 @@ show_system_information() {
             echo -e "${COLOR_BLUE}Borg Repository Information:${COLOR_RESET}"
 
             # Get number of archives
-            local archive_count=$(borg list --short "$BACKUP_DIR" | wc -l)
+            local archive_count=$(borg list --short "$BACKUP_DIR" 2>/dev/null | wc -l)
             echo -e "  ${COLOR_GREEN}Repository:${COLOR_RESET} $BACKUP_DIR"
             echo -e "  ${COLOR_GREEN}Archives:${COLOR_RESET} $archive_count"
 
             # Get repository size
             local repo_info=$(borg info --json "$BACKUP_DIR" 2>/dev/null)
             if [ -n "$repo_info" ]; then
-                local total_size=$(echo "$repo_info" | grep -o '"total_size":[0-9]*' | cut -d':' -f2)
-                local total_unique=$(echo "$repo_info" | grep -o '"unique_size":[0-9]*' | cut -d':' -f2)
+                local total_size=$(echo "$repo_info" | grep -o '"total_size":[0-9]*' | grep -o '[0-9]*')
+                local total_unique=$(echo "$repo_info" | grep -o '"unique_size":[0-9]*' | grep -o '[0-9]*')
 
                 # Convert to human-readable format
                 if [ -n "$total_size" ] && [ -n "$total_unique" ]; then
@@ -1651,7 +2006,10 @@ show_system_information() {
         if command -v df >/dev/null 2>&1; then
             echo ""
             echo -e "${COLOR_BLUE}Host Disk Usage:${COLOR_RESET}"
-            df -h $(docker info --format '{{.DockerRootDir}}' | cut -d':' -f1) | head -2
+            # Get Docker root directory safely
+            local docker_root
+            docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo "/var/lib/docker")
+            df -h "$docker_root" | head -2
         fi
 
         echo ""
@@ -1756,17 +2114,26 @@ main() {
         # Display total disk space reclaimed (if available)
         if command -v df >/dev/null 2>&1; then
             echo -e "${COLOR_BLUE}Current disk usage:${COLOR_RESET}"
-            df -h $(docker info --format '{{.DockerRootDir}}' | cut -d':' -f1)
+            local docker_root
+            docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo "/var/lib/docker")
+            df -h "$docker_root"
         fi
     else
         # Get current disk usage for JSON output
         if command -v df >/dev/null 2>&1; then
-            local docker_root=$(docker info --format '{{.DockerRootDir}}' | cut -d':' -f1)
-            local df_output=$(df -h "$docker_root" | awk 'NR==2 {print $1","$2","$3","$4","$5","$6}')
-            local IFS=','
-            read -ra df_fields <<<"$df_output"
+            local docker_root
+            docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo "/var/lib/docker")
+            local df_output
+            df_output=$(df -h "$docker_root" | awk 'NR==2 {print $1","$2","$3","$4","$5","$6}')
 
-            echo '{"status":"completed","message":"Docker cleanup process completed","dry_run":'$DRY_RUN',"current_disk_usage":{"filesystem":"'${df_fields[0]}'","size":"'${df_fields[1]}'","used":"'${df_fields[2]}'","available":"'${df_fields[3]}'","use_percent":"'${df_fields[4]}'","mounted_on":"'${df_fields[5]}'"}}'
+            if [ -n "$df_output" ]; then
+                local IFS=','
+                read -ra df_fields <<<"$df_output"
+
+                echo '{"status":"completed","message":"Docker cleanup process completed","dry_run":'$DRY_RUN',"current_disk_usage":{"filesystem":"'${df_fields[0]}'","size":"'${df_fields[1]}'","used":"'${df_fields[2]}'","available":"'${df_fields[3]}'","use_percent":"'${df_fields[4]}'","mounted_on":"'${df_fields[5]}'"}}'
+            else
+                echo '{"status":"completed","message":"Docker cleanup process completed","dry_run":'$DRY_RUN'}'
+            fi
         else
             echo '{"status":"completed","message":"Docker cleanup process completed","dry_run":'$DRY_RUN'}'
         fi
@@ -1779,9 +2146,11 @@ main() {
     fi
 }
 
+# Register trap for cleanup
+trap handle_signal EXIT INT TERM
+
 # Ensure log directory exists
 ensure_log_directory
 
 # Run the main function
 main
-cleanup_and_exit 0

@@ -145,7 +145,7 @@ confirm_action() {
     fi
 }
 
-# Function to check cron time format
+# Function to check cron time format with improved validation
 validate_cron_time() {
     local cron_expr="$1"
 
@@ -153,9 +153,49 @@ validate_cron_time() {
         return 1
     fi
 
-    # Basic validation for cron format (5 fields)
-    if ! [[ "$cron_expr" =~ ^[0-9*,-/]+[[:space:]][0-9*,-/]+[[:space:]][0-9*,-/]+[[:space:]][0-9*,-/]+[[:space:]][0-9*,-/]+$ ]]; then
-        echo -e "${COLOR_RED}ERROR: Invalid cron expression format. Should be like '0 2 * * *'${COLOR_RESET}"
+    # Split the cron expression into fields
+    local -a fields=($cron_expr)
+
+    # Check correct number of fields (5 for standard cron)
+    if [ ${#fields[@]} -ne 5 ]; then
+        echo -e "${COLOR_RED}ERROR: Invalid cron expression format. Should have 5 fields: minute hour day month weekday${COLOR_RESET}"
+        return 1
+    fi
+
+    # Validate each field's format
+    local valid=true
+
+    # Minutes: 0-59
+    if ! [[ "${fields[0]}" =~ ^[0-9*,-/]+$ ]] || [[ "${fields[0]}" =~ [0-9]{1,2} ]] && [ "${fields[0]/#*([^0-9])/}" -gt 59 ]; then
+        echo -e "${COLOR_RED}ERROR: Invalid minute field in cron expression${COLOR_RESET}"
+        valid=false
+    fi
+
+    # Hours: 0-23
+    if ! [[ "${fields[1]}" =~ ^[0-9*,-/]+$ ]] || [[ "${fields[1]}" =~ [0-9]{1,2} ]] && [ "${fields[1]/#*([^0-9])/}" -gt 23 ]; then
+        echo -e "${COLOR_RED}ERROR: Invalid hour field in cron expression${COLOR_RESET}"
+        valid=false
+    fi
+
+    # Days: 1-31
+    if ! [[ "${fields[2]}" =~ ^[0-9*,-/]+$ ]] || [[ "${fields[2]}" =~ [0-9]{1,2} ]] && ([ "${fields[2]/#*([^0-9])/}" -lt 1 ] || [ "${fields[2]/#*([^0-9])/}" -gt 31 ]); then
+        echo -e "${COLOR_RED}ERROR: Invalid day field in cron expression${COLOR_RESET}"
+        valid=false
+    fi
+
+    # Months: 1-12
+    if ! [[ "${fields[3]}" =~ ^[0-9*,-/]+$ ]] || [[ "${fields[3]}" =~ [0-9]{1,2} ]] && ([ "${fields[3]/#*([^0-9])/}" -lt 1 ] || [ "${fields[3]/#*([^0-9])/}" -gt 12 ]); then
+        echo -e "${COLOR_RED}ERROR: Invalid month field in cron expression${COLOR_RESET}"
+        valid=false
+    fi
+
+    # Weekdays: 0-7 (0 and 7 are Sunday)
+    if ! [[ "${fields[4]}" =~ ^[0-9*,-/]+$ ]] || [[ "${fields[4]}" =~ [0-9]{1} ]] && [ "${fields[4]/#*([^0-9])/}" -gt 7 ]; then
+        echo -e "${COLOR_RED}ERROR: Invalid weekday field in cron expression${COLOR_RESET}"
+        valid=false
+    fi
+
+    if [ "$valid" != "true" ]; then
         return 1
     fi
 
@@ -205,12 +245,20 @@ fi
 
 # Detect the init system
 echo -e "${COLOR_BLUE}Detecting init system...${COLOR_RESET}"
+INIT_SYSTEM="unknown"
+
 if command_exists systemctl && systemctl --version >/dev/null 2>&1; then
     echo -e "${COLOR_GREEN}Detected init system: systemd${COLOR_RESET}"
     INIT_SYSTEM="systemd"
 elif command_exists service; then
-    echo -e "${COLOR_GREEN}Detected init system: sysvinit/upstart${COLOR_RESET}"
-    INIT_SYSTEM="sysv"
+    # Check for upstart-specific commands
+    if command_exists initctl && initctl version 2>/dev/null | grep -q "upstart"; then
+        echo -e "${COLOR_GREEN}Detected init system: upstart${COLOR_RESET}"
+        INIT_SYSTEM="upstart"
+    else
+        echo -e "${COLOR_GREEN}Detected init system: sysvinit${COLOR_RESET}"
+        INIT_SYSTEM="sysv"
+    fi
 elif [ -f /etc/init.d/docker ]; then
     echo -e "${COLOR_GREEN}Detected init system: sysvinit${COLOR_RESET}"
     INIT_SYSTEM="sysv"
@@ -364,9 +412,13 @@ for script in "${SCRIPT_NAMES[@]}"; do
 done
 
 # Also install the install script itself
-cp "./docker_install.sh" "$INSTALL_DIR/docker_install"
-chmod +x "$INSTALL_DIR/docker_install"
-echo -e "${COLOR_GREEN}Installed: $INSTALL_DIR/docker_install${COLOR_RESET}"
+if [ -f "./docker_install.sh" ]; then
+    cp "./docker_install.sh" "$INSTALL_DIR/docker_install"
+    chmod +x "$INSTALL_DIR/docker_install"
+    echo -e "${COLOR_GREEN}Installed: $INSTALL_DIR/docker_install${COLOR_RESET}"
+else
+    echo -e "${COLOR_YELLOW}Warning: docker_install.sh not found, skipping self-installation${COLOR_RESET}"
+fi
 
 # Create configuration file with default settings
 CONFIG_DIR="/etc/docker-volume-tools"
@@ -595,13 +647,74 @@ EOF
         # Reload systemd and enable timer
         systemctl daemon-reload
         systemctl enable docker-volume-backup.timer
-        systemctl start docker-volume-backup.timer
+
+        # Only start the timer if explicitly requested
+        if confirm_action "Start the timer now? (This will schedule the backups without running one immediately)"; then
+            systemctl start docker-volume-backup.timer
+            echo -e "${COLOR_GREEN}Timer activated. First backup will run at the next scheduled time.${COLOR_RESET}"
+        fi
 
         echo -e "${COLOR_GREEN}Systemd service and timer created and enabled.${COLOR_RESET}"
         echo -e "${COLOR_GREEN}Backup will run daily at 1:00 AM.${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}You can check the timer status with: systemctl status docker-volume-backup.timer${COLOR_RESET}"
     else
         echo -e "${COLOR_BLUE}Skipping systemd service creation.${COLOR_RESET}"
+    fi
+elif [ "$INIT_SYSTEM" = "upstart" ]; then
+    echo -e "${COLOR_BLUE}Would you like to create an Upstart job for scheduled backups?${COLOR_RESET}"
+
+    if [ "$FORCE" = true ] || confirm_action "Create Upstart job?"; then
+        # Create Upstart job file
+        UPSTART_FILE="/etc/init/docker-volume-backup.conf"
+
+        cat >"$UPSTART_FILE" <<EOF
+# docker-volume-backup - Docker Volume backup job
+#
+# This service runs the Docker volume backup daily
+
+description "Docker Volume Backup"
+
+start on runlevel [2345]
+stop on runlevel [!2345]
+
+# Run once per day at 1:00 AM
+env BACKUP_TIME="01:00"
+
+script
+    # Get current time
+    CURRENT_TIME=\$(date +%H:%M)
+    
+    while true; do
+        if [ "\$CURRENT_TIME" = "\$BACKUP_TIME" ]; then
+            logger -t docker-volume-backup "Starting scheduled backup"
+            $INSTALL_DIR/docker_backup_full --force >> $LOG_DIR/cron_backup.log 2>&1
+            logger -t docker-volume-backup "Backup completed"
+            # Sleep past the backup time to avoid multiple runs
+            sleep 65
+        fi
+        
+        # Update current time
+        CURRENT_TIME=\$(date +%H:%M)
+        sleep 60
+    done
+end script
+EOF
+
+        chmod 644 "$UPSTART_FILE"
+
+        # Start the service if requested
+        if confirm_action "Start the Upstart job now?"; then
+            if service docker-volume-backup start; then
+                echo -e "${COLOR_GREEN}Upstart job started successfully.${COLOR_RESET}"
+            else
+                echo -e "${COLOR_RED}Failed to start Upstart job.${COLOR_RESET}"
+            fi
+        fi
+
+        echo -e "${COLOR_GREEN}Upstart job created. Backup will run daily at 1:00 AM.${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}You can check the job status with: service docker-volume-backup status${COLOR_RESET}"
+    else
+        echo -e "${COLOR_BLUE}Skipping Upstart job creation.${COLOR_RESET}"
     fi
 fi
 
@@ -610,13 +723,20 @@ echo -e "${COLOR_BLUE}Would you like to run a backup now?${COLOR_RESET}"
 
 if [ "$FORCE" = true ] || confirm_action "Run initial backup?"; then
     echo -e "${COLOR_BLUE}Running initial backup...${COLOR_RESET}"
-    $INSTALL_DIR/docker_backup_full
 
-    if [ $? -eq 0 ]; then
-        echo -e "${COLOR_GREEN}Initial backup completed successfully!${COLOR_RESET}"
+    # Ensure the executable exists
+    if [ -f "$INSTALL_DIR/docker_backup_full" ]; then
+        $INSTALL_DIR/docker_backup_full
+
+        if [ $? -eq 0 ]; then
+            echo -e "${COLOR_GREEN}Initial backup completed successfully!${COLOR_RESET}"
+        else
+            echo -e "${COLOR_RED}Initial backup failed. Please check logs for details.${COLOR_RESET}"
+            echo -e "${COLOR_YELLOW}Log file: $LOG_DIR/backup.log${COLOR_RESET}"
+        fi
     else
-        echo -e "${COLOR_RED}Initial backup failed. Please check logs for details.${COLOR_RESET}"
-        echo -e "${COLOR_YELLOW}Log file: $LOG_DIR/backup.log${COLOR_RESET}"
+        echo -e "${COLOR_RED}ERROR: Backup executable not found at $INSTALL_DIR/docker_backup_full${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}You can run a backup later with: sudo docker_backup_full${COLOR_RESET}"
     fi
 else
     echo -e "${COLOR_BLUE}Skipping initial backup.${COLOR_RESET}"
