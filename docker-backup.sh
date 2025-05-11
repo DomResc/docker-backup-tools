@@ -97,29 +97,33 @@ send_email() {
             cat "$EMAIL_TEMP_FILE"
         } >"$email_body_file"
 
-        # MSMTP configuration
-        local msmtp_args=()
-        if [ -n "$EMAIL_SMTP_USER" ]; then
-            msmtp_args+=(--user="$EMAIL_SMTP_USER")
-        fi
-        if [ -n "$EMAIL_SMTP_PASSWORD" ]; then
-            msmtp_args+=(--password="$EMAIL_SMTP_PASSWORD")
-        fi
-        if [ "$EMAIL_SMTP_TLS" = true ]; then
-            msmtp_args+=(--tls=on --tls-starttls=on)
-        else
-            msmtp_args+=(--tls=off)
-        fi
+        # Create temporary msmtp config
+        local msmtp_config=$(mktemp)
+        {
+            echo "account default"
+            echo "host $EMAIL_SMTP_SERVER"
+            echo "port $EMAIL_SMTP_PORT"
+            echo "from $EMAIL_FROM"
+            echo "user $EMAIL_SMTP_USER"
+            echo "password $EMAIL_SMTP_PASSWORD"
+            echo "auth on"
+            if [ "$EMAIL_SMTP_TLS" = true ]; then
+                echo "tls on"
+                echo "tls_starttls on"
+            else
+                echo "tls off"
+            fi
+        } >"$msmtp_config"
 
-        # Send email with msmtp
-        if cat "$email_body_file" | msmtp "${msmtp_args[@]}" --host="$EMAIL_SMTP_SERVER" --port="$EMAIL_SMTP_PORT" --from="$EMAIL_FROM" "$EMAIL_TO"; then
+        # Send email using config file
+        if cat "$email_body_file" | msmtp --file="$msmtp_config" "$EMAIL_TO"; then
             log "Notification email sent to $EMAIL_TO"
         else
             log "Email sending failed" "ERROR"
         fi
 
-        # Remove temporary file
-        rm -f "$email_body_file"
+        # Remove temporary files
+        rm -f "$msmtp_config" "$email_body_file"
     fi
 }
 
