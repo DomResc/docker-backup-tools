@@ -38,6 +38,7 @@ LOG_DIR="/var/log/docker"
 LOG_FILE="${LOG_DIR}/restore.log"
 DOCKER_SERVICE="docker.service"
 DOCKER_SOCKET="docker.socket"
+LOCK_FILE="/var/lock/docker_restore_full.lock"
 
 # Color definitions
 COLOR_RESET="\033[0m"
@@ -50,8 +51,12 @@ COLOR_CYAN="\033[0;36m"
 COLOR_WHITE="\033[0;37m"
 COLOR_BOLD="\033[1m"
 
-# Flag to track if we stopped docker
+# Flag to track Docker and backup states
 DOCKER_STOPPED=false
+DOCKER_RESTARTED=false
+DOCKER_DIR_BACKED_UP=false
+BACKUP_DIR_NAME=""
+RESTORE_SUCCESS=false
 
 # Parse command line arguments
 usage() {
@@ -64,6 +69,7 @@ usage() {
   echo -e "${COLOR_CYAN}Options:${COLOR_RESET}"
   echo -e "  ${COLOR_GREEN}-d, --directory DIR${COLOR_RESET}  Backup directory (default: $DEFAULT_BACKUP_DIR)"
   echo -e "  ${COLOR_GREEN}-f, --force${COLOR_RESET}          Don't ask for confirmation"
+  echo -e "  ${COLOR_GREEN}-k, --keep-backup${COLOR_RESET}    Keep backup of current Docker directory after successful restore"
   echo -e "  ${COLOR_GREEN}-h, --help${COLOR_RESET}           Display this help message"
   echo ""
   echo -e "${COLOR_CYAN}Environment variables:${COLOR_RESET}"
@@ -74,6 +80,7 @@ usage() {
 # Get settings from environment variables or use defaults
 BACKUP_DIR=${DOCKER_BACKUP_DIR:-$DEFAULT_BACKUP_DIR}
 FORCE=false
+KEEP_BACKUP=false
 ARCHIVE_ARG=""
 
 # Parse command line options
@@ -85,6 +92,10 @@ while [[ $# -gt 0 ]]; do
     ;;
   -f | --force)
     FORCE=true
+    shift
+    ;;
+  -k | --keep-backup)
+    KEEP_BACKUP=true
     shift
     ;;
   -h | --help)
@@ -101,25 +112,78 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Exit handlers
+cleanup_and_exit() {
+  local exit_code=$1
+
+  # Release lock file
+  if [ -f "$LOCK_FILE" ]; then
+    rm -f "$LOCK_FILE"
+    log "INFO" "Released lock file"
+  fi
+
+  # Ensure descriptors are closed
+  exec 3>&- 4>&- 2>&- 1>&-
+
+  exit $exit_code
+}
+
+# Obtain a lock file to prevent multiple instances
+obtain_lock() {
+  log "INFO" "Attempting to obtain lock"
+
+  # Check if lock file exists and if process is still running
+  if [ -f "$LOCK_FILE" ]; then
+    local pid=$(cat "$LOCK_FILE")
+    if ps -p "$pid" >/dev/null 2>&1; then
+      log "ERROR" "Another restore process is already running (PID: $pid)"
+      echo -e "${COLOR_RED}ERROR: Another restore process is already running (PID: $pid)${COLOR_RESET}"
+      echo -e "${COLOR_YELLOW}If you're sure no other restore is running, remove the lock file:${COLOR_RESET}"
+      echo -e "${COLOR_CYAN}sudo rm -f $LOCK_FILE${COLOR_RESET}"
+      cleanup_and_exit 1
+    else
+      log "WARNING" "Stale lock file found. Removing it."
+      rm -f "$LOCK_FILE"
+    fi
+  fi
+
+  # Create lock file with current PID
+  echo $$ >"$LOCK_FILE"
+
+  # Verify lock was obtained
+  if [ ! -f "$LOCK_FILE" ] || [ "$(cat "$LOCK_FILE")" != "$$" ]; then
+    log "ERROR" "Failed to create lock file"
+    echo -e "${COLOR_RED}ERROR: Failed to create lock file${COLOR_RESET}"
+    cleanup_and_exit 1
+  fi
+
+  log "INFO" "Lock obtained successfully"
+}
+
 # Setup logging
 ensure_log_directory() {
   if [ ! -d "$LOG_DIR" ]; then
     mkdir -p "$LOG_DIR"
     if [ $? -ne 0 ]; then
       echo -e "${COLOR_RED}ERROR: Failed to create log directory $LOG_DIR${COLOR_RESET}"
-      echo -e "${COLOR_YELLOW}Run the following commands to create the directory with correct permissions:${COLOR_RESET}"
+      echo -e "${COLOR_YELLOW}Run the following command to create the directory with correct permissions:${COLOR_RESET}"
       echo -e "${COLOR_CYAN}sudo mkdir -p $LOG_DIR${COLOR_RESET}"
-      echo -e "${COLOR_CYAN}sudo chown $USER:$USER $LOG_DIR${COLOR_RESET}"
-      exit 1
+      cleanup_and_exit 1
     fi
+
+    # Set proper permissions for log directory
+    chmod 750 "$LOG_DIR"
   fi
 
   if [ ! -f "$LOG_FILE" ]; then
     touch "$LOG_FILE"
     if [ $? -ne 0 ]; then
       echo -e "${COLOR_RED}ERROR: Failed to create log file $LOG_FILE${COLOR_RESET}"
-      exit 1
+      cleanup_and_exit 1
     fi
+
+    # Set proper permissions for log file
+    chmod 640 "$LOG_FILE"
   fi
 }
 
@@ -162,8 +226,8 @@ check_borg_installation() {
   if ! command_exists borg; then
     log "ERROR" "Borg Backup is not installed"
 
-    # Verifica se lo script di installazione è disponibile
-    local install_script="/usr/local/bin/docker_install.sh"
+    # Check if installation script is available
+    local install_script="/usr/local/bin/docker_install"
     local repo_install_script="./docker_install.sh"
 
     if [ -f "$install_script" ]; then
@@ -174,20 +238,20 @@ check_borg_installation() {
           log "INFO" "Running installation script"
           "$install_script"
 
-          # Verifica se l'installazione ha avuto successo
+          # Check if installation was successful
           if ! command_exists borg; then
             log "ERROR" "Installation failed. Borg is still not available."
-            exit 1
+            cleanup_and_exit 1
           else
             log "INFO" "Borg installed successfully"
             return 0
           fi
         else
           log "INFO" "Restoration canceled because Borg is not installed"
-          exit 1
+          cleanup_and_exit 1
         fi
       else
-        exit 1
+        cleanup_and_exit 1
       fi
     elif [ -f "$repo_install_script" ]; then
       echo -e "${COLOR_YELLOW}Would you like to run the installation script? ($repo_install_script)${COLOR_RESET}"
@@ -197,20 +261,20 @@ check_borg_installation() {
           log "INFO" "Running installation script"
           "$repo_install_script"
 
-          # Verifica se l'installazione ha avuto successo
+          # Check if installation was successful
           if ! command_exists borg; then
             log "ERROR" "Installation failed. Borg is still not available."
-            exit 1
+            cleanup_and_exit 1
           else
             log "INFO" "Borg installed successfully"
             return 0
           fi
         else
           log "INFO" "Restoration canceled because Borg is not installed"
-          exit 1
+          cleanup_and_exit 1
         fi
       else
-        exit 1
+        cleanup_and_exit 1
       fi
     else
       echo -e "${COLOR_RED}Installation script not found.${COLOR_RESET}"
@@ -218,7 +282,7 @@ check_borg_installation() {
       echo -e "${COLOR_CYAN}git clone https://github.com/domresc/docker-volume-tools.git${COLOR_RESET}"
       echo -e "${COLOR_CYAN}cd docker-volume-tools${COLOR_RESET}"
       echo -e "${COLOR_CYAN}sudo bash docker_install.sh${COLOR_RESET}"
-      exit 1
+      cleanup_and_exit 1
     fi
   fi
 
@@ -231,22 +295,34 @@ check_borg_installation() {
   return 0
 }
 
-# Check if the repository exists
+# Check if the repository exists and is a valid Borg repository
 check_repository() {
   if ! [ -d "$BACKUP_DIR" ]; then
     log "ERROR" "Backup directory $BACKUP_DIR does not exist"
     echo -e "${COLOR_RED}ERROR: Backup directory $BACKUP_DIR does not exist${COLOR_RESET}"
-    exit 1
+    cleanup_and_exit 1
   fi
 
   # Check if it's a valid borg repository
   if ! borg info "$BACKUP_DIR" >/dev/null 2>&1; then
     log "ERROR" "Directory $BACKUP_DIR is not a valid Borg repository"
     echo -e "${COLOR_RED}ERROR: Directory $BACKUP_DIR is not a valid Borg repository${COLOR_RESET}"
-    exit 1
+    cleanup_and_exit 1
   fi
 
   log "INFO" "Valid Borg repository found at $BACKUP_DIR"
+
+  # Check if repository is encrypted
+  local repo_info=$(borg info --json "$BACKUP_DIR" 2>/dev/null)
+  if echo "$repo_info" | grep -q '"encryption_keyfile"'; then
+    log "INFO" "Repository is encrypted with keyfile"
+    echo -e "${COLOR_YELLOW}Repository is encrypted with keyfile. You will be prompted for the passphrase during restore.${COLOR_RESET}"
+  elif echo "$repo_info" | grep -q '"encryption_key"'; then
+    log "INFO" "Repository is encrypted with repokey"
+    echo -e "${COLOR_YELLOW}Repository is encrypted with repokey. You will be prompted for the passphrase during restore.${COLOR_RESET}"
+  else
+    log "INFO" "Repository is not encrypted"
+  fi
 }
 
 # Check disk space for restoration
@@ -256,7 +332,7 @@ check_disk_space() {
 
   # Get archive info
   local archive_info=$(borg info --json "$BACKUP_DIR::$archive" 2>/dev/null)
-  local archive_size=$(echo "$archive_info" | grep -o '"original_size": [0-9]*' | cut -d' ' -f2)
+  local archive_size=$(echo "$archive_info" | grep -o '"original_size":[0-9]*' | grep -o '[0-9]*')
 
   if [ -z "$archive_size" ]; then
     log "WARNING" "Could not determine archive size. Make sure you have sufficient disk space."
@@ -281,7 +357,7 @@ check_disk_space() {
       read -p "$(echo -e "${COLOR_YELLOW}Available space may be insufficient. Continue anyway? (y/n): ${COLOR_RESET}")" confirm
       if [ "$confirm" != "y" ]; then
         log "INFO" "Restoration canceled by user due to space concerns"
-        exit 0
+        cleanup_and_exit 0
       fi
     else
       log "WARNING" "Continuing despite potential space issues due to force flag"
@@ -302,28 +378,35 @@ show_archives() {
   if [ ${#archives[@]} -eq 0 ]; then
     log "ERROR" "No archives found in repository"
     echo -e "${COLOR_RED}No archives found in repository $BACKUP_DIR${COLOR_RESET}"
-    exit 1
+    cleanup_and_exit 1
   fi
 
   # Print archives with numbers
   local i=1
   for archive in "${archives[@]}"; do
     local info=$(borg info --json "$BACKUP_DIR::$archive" 2>/dev/null)
-    local date=$(echo "$info" | grep -o '"time": "[^"]*"' | cut -d'"' -f4 | cut -d'.' -f1 | sed 's/T/ /')
-    local size=$(echo "$info" | grep -o '"original_size": [0-9]*' | cut -d' ' -f2)
+    local date=$(echo "$info" | grep -o '"time":[[:space:]]*"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"' | cut -d'.' -f1 | sed 's/T/ /')
+    local size=$(echo "$info" | grep -o '"original_size":[0-9]*' | grep -o '[0-9]*')
 
     # Convert size to human-readable format
-    if [ "$size" -ge $((1024 * 1024 * 1024)) ]; then
-      size=$(echo "scale=2; $size/1024/1024/1024" | bc)
-      size="${size}G"
-    elif [ "$size" -ge $((1024 * 1024)) ]; then
-      size=$(echo "scale=2; $size/1024/1024" | bc)
-      size="${size}M"
-    elif [ "$size" -ge 1024 ]; then
-      size=$(echo "scale=2; $size/1024" | bc)
-      size="${size}K"
+    if [ -n "$size" ]; then
+      if [ "$size" -ge $((1024 * 1024 * 1024 * 1024)) ]; then
+        size=$(echo "scale=2; $size/1024/1024/1024/1024" | bc)
+        size="${size}T"
+      elif [ "$size" -ge $((1024 * 1024 * 1024)) ]; then
+        size=$(echo "scale=2; $size/1024/1024/1024" | bc)
+        size="${size}G"
+      elif [ "$size" -ge $((1024 * 1024)) ]; then
+        size=$(echo "scale=2; $size/1024/1024" | bc)
+        size="${size}M"
+      elif [ "$size" -ge 1024 ]; then
+        size=$(echo "scale=2; $size/1024" | bc)
+        size="${size}K"
+      else
+        size="${size}B"
+      fi
     else
-      size="${size}B"
+      size="Unknown"
     fi
 
     echo -e "  ${COLOR_YELLOW}$i)${COLOR_RESET} $archive ${COLOR_CYAN}(Created: $date, Size: $size)${COLOR_RESET}"
@@ -339,65 +422,93 @@ show_archives() {
 # Manage Docker service (start/stop) with compatibility for different init systems
 manage_docker_service() {
   local action="$1" # 'start' or 'stop'
+  local max_attempts=3
+  local attempt=1
+  local success=false
 
-  # Verify which init system is in use
-  if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
-    # systemd
-    log "INFO" "Using systemd to $action Docker"
-    if [ "$action" = "stop" ]; then
-      systemctl $action $DOCKER_SOCKET
-      systemctl $action $DOCKER_SERVICE
+  while [ $attempt -le $max_attempts ] && [ "$success" = false ]; do
+    log "INFO" "Attempt $attempt to $action Docker service"
+
+    # Detect init system and act accordingly
+    if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+      # systemd
+      log "INFO" "Using systemd to $action Docker"
+      if [ "$action" = "stop" ]; then
+        systemctl stop $DOCKER_SOCKET
+        systemctl stop $DOCKER_SERVICE
+      else
+        systemctl start $DOCKER_SERVICE
+        systemctl start $DOCKER_SOCKET
+      fi
+    elif command -v service >/dev/null 2>&1; then
+      # SysV init or upstart
+      log "INFO" "Using service command to $action Docker"
+      service docker $action
+    elif [ -f /etc/init.d/docker ]; then
+      # SysV init script direct
+      log "INFO" "Using init.d script to $action Docker"
+      /etc/init.d/docker $action
     else
-      systemctl $action $DOCKER_SERVICE
-      systemctl $action $DOCKER_SOCKET
+      # Fallback to direct commands
+      if [ "$action" = "stop" ]; then
+        log "INFO" "Using killall to stop Docker"
+        if command -v killall >/dev/null 2>&1; then
+          killall -TERM dockerd
+        else
+          log "WARNING" "killall not found, trying pkill"
+          pkill -TERM dockerd
+        fi
+      else
+        log "INFO" "Starting Docker daemon directly"
+        if [ -x "$(command -v dockerd)" ]; then
+          dockerd &
+        else
+          log "ERROR" "dockerd command not found"
+          return 1
+        fi
+      fi
     fi
-  elif command -v service >/dev/null 2>&1; then
-    # SysV init or upstart
-    log "INFO" "Using service command to $action Docker"
-    service docker $action
-  elif [ -f /etc/init.d/docker ]; then
-    # SysV init script direct
-    log "INFO" "Using init.d script to $action Docker"
-    /etc/init.d/docker $action
-  else
-    # Fallback to direct commands
-    if [ "$action" = "stop" ]; then
-      log "INFO" "Using killall to stop Docker"
-      killall -TERM dockerd
+
+    # Verify the operation status
+    local max_wait=30
+    local counter=0
+    local expected_status=$([[ "$action" = "start" ]] && echo "running" || echo "stopped")
+
+    while [ $counter -lt $max_wait ]; do
+      sleep 1
+      counter=$((counter + 1))
+
+      if docker info >/dev/null 2>&1; then
+        local current_status="running"
+      else
+        local current_status="stopped"
+      fi
+
+      if [ "$current_status" = "$expected_status" ]; then
+        success=true
+        break
+      fi
+    done
+
+    if [ "$success" = true ]; then
+      log "INFO" "Docker service $action successfully"
+      return 0
     else
-      log "INFO" "Starting Docker daemon directly"
-      dockerd &
-    fi
-  fi
+      log "WARNING" "Failed to $action Docker service on attempt $attempt"
+      attempt=$((attempt + 1))
 
-  # Verify the operation status
-  local max_wait=30
-  local counter=0
-  local expected_status=$([[ "$action" = "start" ]] && echo "running" || echo "stopped")
-
-  while true; do
-    sleep 1
-    counter=$((counter + 1))
-
-    if docker info >/dev/null 2>&1; then
-      local current_status="running"
-    else
-      local current_status="stopped"
-    fi
-
-    if [ "$current_status" = "$expected_status" ]; then
-      break
-    fi
-
-    if [ $counter -ge $max_wait ]; then
-      log "ERROR" "Failed to $action Docker service within $max_wait seconds"
-      echo -e "${COLOR_RED}ERROR: Failed to $action Docker service${COLOR_RESET}"
-      return 1
+      # Wait before retrying
+      if [ $attempt -le $max_attempts ]; then
+        log "INFO" "Waiting 5 seconds before next attempt..."
+        sleep 5
+      fi
     fi
   done
 
-  log "INFO" "Docker service $action successfully"
-  return 0
+  # If we got here, all attempts failed
+  log "ERROR" "Failed to $action Docker service after $max_attempts attempts"
+  echo -e "${COLOR_RED}ERROR: Failed to $action Docker service${COLOR_RESET}"
+  return 1
 }
 
 # Stop Docker service
@@ -407,6 +518,7 @@ stop_docker() {
   # Check if Docker is running
   if ! docker info >/dev/null 2>&1; then
     log "INFO" "Docker service is already stopped"
+    DOCKER_STOPPED=true
     return 0
   fi
 
@@ -415,7 +527,7 @@ stop_docker() {
     read -p "$(echo -e "${COLOR_YELLOW}Are you sure you want to continue? (y/n): ${COLOR_RESET}")" confirm
     if [ "$confirm" != "y" ]; then
       log "INFO" "Restoration canceled by user"
-      exit 0
+      cleanup_and_exit 0
     fi
   fi
 
@@ -427,7 +539,7 @@ stop_docker() {
     DOCKER_STOPPED=true
   else
     echo -e "${COLOR_RED}ERROR: Failed to stop Docker service${COLOR_RESET}"
-    exit 1
+    cleanup_and_exit 1
   fi
 }
 
@@ -444,6 +556,8 @@ start_docker() {
       echo -e "${COLOR_YELLOW}You may need to start it manually with: sudo systemctl start $DOCKER_SERVICE${COLOR_RESET}"
       return 1
     fi
+    DOCKER_RESTARTED=true
+    log "INFO" "Docker service started successfully"
   else
     log "INFO" "Docker was not stopped, no need to start it"
   fi
@@ -453,10 +567,51 @@ start_docker() {
 
 # Function to ensure Docker is restarted on script exit or error
 cleanup_on_exit() {
+  local exit_code=$1
+
   log "INFO" "Running cleanup on exit"
 
+  # If backup was successful, prompt for cleanup of the old backup
+  if [ "$RESTORE_SUCCESS" = true ] && [ "$DOCKER_DIR_BACKED_UP" = true ] && [ "$KEEP_BACKUP" != true ]; then
+    if [ -d "$BACKUP_DIR_NAME" ]; then
+      log "INFO" "Restore was successful. Removing backup of previous Docker directory"
+      rm -rf "$BACKUP_DIR_NAME"
+      log "INFO" "Previous Docker directory backup removed"
+    fi
+  elif [ "$RESTORE_SUCCESS" != true ] && [ "$DOCKER_DIR_BACKED_UP" = true ]; then
+    # Restore failed, offer to rollback to previous state
+    if [ -d "$BACKUP_DIR_NAME" ] && [ -d "$DOCKER_DIR" ]; then
+      log "WARNING" "Restore failed. Would you like to rollback to the previous Docker state?"
+      if [ "$FORCE" != "true" ]; then
+        read -p "$(echo -e "${COLOR_YELLOW}Rollback to previous Docker state? (y/n): ${COLOR_RESET}")" confirm
+        if [ "$confirm" = "y" ]; then
+          log "INFO" "Rolling back to previous Docker state"
+          stop_docker
+          rm -rf "$DOCKER_DIR"
+          mv "$BACKUP_DIR_NAME" "$DOCKER_DIR"
+          log "INFO" "Rollback completed"
+          start_docker
+        else
+          log "INFO" "Rollback canceled by user"
+        fi
+      fi
+    fi
+  elif [ "$DOCKER_DIR_BACKED_UP" = true ] && [ "$KEEP_BACKUP" = true ]; then
+    log "INFO" "Keeping backup of previous Docker directory as requested: $BACKUP_DIR_NAME"
+    echo -e "${COLOR_YELLOW}Previous Docker directory was backed up to: $BACKUP_DIR_NAME${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}This backup has been kept as requested.${COLOR_RESET}"
+  fi
+
   # Make sure Docker is running
-  start_docker
+  if [ "$DOCKER_STOPPED" = true ] && [ "$DOCKER_RESTARTED" != true ]; then
+    start_docker
+  fi
+
+  # Cleanup lock file before exit
+  if [ -f "$LOCK_FILE" ]; then
+    rm -f "$LOCK_FILE"
+    log "INFO" "Lock file released"
+  fi
 
   log "INFO" "Cleanup completed"
 }
@@ -468,21 +623,21 @@ backup_docker_dir() {
     return 0
   fi
 
-  local backup_dir="${DOCKER_DIR}.bak.$(date +%Y%m%d%H%M%S)"
-  log "INFO" "Creating backup of current Docker directory to $backup_dir"
+  BACKUP_DIR_NAME="${DOCKER_DIR}.bak.$(date +%Y%m%d%H%M%S)"
+  log "INFO" "Creating backup of current Docker directory to $BACKUP_DIR_NAME"
 
-  if [ -d "$backup_dir" ]; then
-    log "ERROR" "Backup directory $backup_dir already exists"
-    echo -e "${COLOR_RED}ERROR: Backup directory $backup_dir already exists${COLOR_RESET}"
-    exit 1
+  if [ -d "$BACKUP_DIR_NAME" ]; then
+    log "ERROR" "Backup directory $BACKUP_DIR_NAME already exists"
+    echo -e "${COLOR_RED}ERROR: Backup directory $BACKUP_DIR_NAME already exists${COLOR_RESET}"
+    cleanup_and_exit 1
   fi
 
   echo -e "${COLOR_CYAN}${COLOR_BOLD}Backing up current Docker directory...${COLOR_RESET}"
 
-  if ! mv "$DOCKER_DIR" "$backup_dir"; then
+  if ! mv "$DOCKER_DIR" "$BACKUP_DIR_NAME"; then
     log "ERROR" "Failed to backup Docker directory"
     echo -e "${COLOR_RED}ERROR: Failed to backup Docker directory${COLOR_RESET}"
-    exit 1
+    cleanup_and_exit 1
   fi
 
   # Create an empty Docker directory
@@ -490,12 +645,23 @@ backup_docker_dir() {
     log "ERROR" "Failed to create new Docker directory"
     echo -e "${COLOR_RED}ERROR: Failed to create new Docker directory${COLOR_RESET}"
     # Try to restore the original directory
-    mv "$backup_dir" "$DOCKER_DIR"
-    exit 1
+    if [ -d "$BACKUP_DIR_NAME" ]; then
+      log "INFO" "Attempting to restore from backup directory"
+      if rm -rf "$DOCKER_DIR" && mv "$BACKUP_DIR_NAME" "$DOCKER_DIR"; then
+        log "INFO" "Successfully restored original Docker directory"
+      else
+        log "ERROR" "Failed to restore original Docker directory. Manual intervention required."
+        echo -e "${COLOR_RED}CRITICAL ERROR: Failed to restore original Docker directory.${COLOR_RESET}"
+        echo -e "${COLOR_RED}Your Docker installation may be in an inconsistent state.${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}You may need to manually restore from: $BACKUP_DIR_NAME${COLOR_RESET}"
+      fi
+    fi
+    cleanup_and_exit 1
   fi
 
-  log "INFO" "Current Docker directory backed up successfully to $backup_dir"
-  echo -e "${COLOR_GREEN}Current Docker directory backed up to: $backup_dir${COLOR_RESET}"
+  log "INFO" "Current Docker directory backed up successfully to $BACKUP_DIR_NAME"
+  echo -e "${COLOR_GREEN}Current Docker directory backed up to: $BACKUP_DIR_NAME${COLOR_RESET}"
+  DOCKER_DIR_BACKED_UP=true
 
   return 0
 }
@@ -504,17 +670,17 @@ backup_docker_dir() {
 set_docker_permissions() {
   log "INFO" "Setting proper permissions on Docker directory"
 
-  # Imposta proprietà di base
+  # Set basic ownership
   chown -R root:root "$DOCKER_DIR"
 
-  # Imposta permessi specifici per sottodirectory Docker
+  # Set specific permissions for Docker subdirectories
   if [ -d "$DOCKER_DIR/volumes" ]; then
     chmod 711 "$DOCKER_DIR/volumes"
-    # Imposta permessi ricorsivi per le sottodirectory dei volumi
+    # Set recursive permissions for volume subdirectories
     find "$DOCKER_DIR/volumes" -type d -exec chmod 755 {} \;
   fi
 
-  # Imposta permessi per i file di configurazione
+  # Set permissions for configuration files
   if [ -d "$DOCKER_DIR/containers" ]; then
     chmod 710 "$DOCKER_DIR/containers"
     find "$DOCKER_DIR/containers" -type f -name "*.json" -exec chmod 640 {} \;
@@ -523,7 +689,31 @@ set_docker_permissions() {
   log "INFO" "Docker permissions set successfully"
 }
 
-# Restore an archive
+# Verify Docker is working after restore
+verify_docker_functionality() {
+  log "INFO" "Verifying Docker functionality after restore"
+
+  # Check if Docker info command works
+  if ! docker info >/dev/null 2>&1; then
+    log "ERROR" "Docker failed to start properly after restoration"
+    echo -e "${COLOR_RED}ERROR: Docker failed to start properly after restoration${COLOR_RESET}"
+    return 1
+  fi
+
+  # Try to run a simple container
+  if ! docker run --rm hello-world >/dev/null 2>&1; then
+    log "WARNING" "Docker is running but failed to start a test container"
+    echo -e "${COLOR_YELLOW}WARNING: Docker is running but failed to start a test container${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}Docker service is running but may not be fully functional${COLOR_RESET}"
+    return 1
+  fi
+
+  log "INFO" "Docker is functioning correctly after restore"
+  echo -e "${COLOR_GREEN}Docker is functioning correctly after restore${COLOR_RESET}"
+  return 0
+}
+
+# Restore an archive with improved path handling
 restore_archive() {
   local archive="$1"
   local start_time=$(date +%s)
@@ -534,7 +724,7 @@ restore_archive() {
   if ! borg info "$BACKUP_DIR::$archive" >/dev/null 2>&1; then
     log "ERROR" "Archive $archive not found in repository"
     echo -e "${COLOR_RED}ERROR: Archive $archive not found in repository${COLOR_RESET}"
-    exit 1
+    cleanup_and_exit 1
   fi
 
   # Check disk space
@@ -546,17 +736,33 @@ restore_archive() {
   # Backup current Docker directory
   backup_docker_dir
 
-  # Extract the archive - FIXED: specifying correct extraction path and strategy
+  # Extract the archive with improved path handling
   log "INFO" "Extracting archive $archive to $DOCKER_DIR"
   echo -e "${COLOR_CYAN}${COLOR_BOLD}Extracting backup archive... This may take some time.${COLOR_RESET}"
 
-  # Cambia directory alla radice e limita l'estrazione a /var/lib/docker
-  cd /
-  if ! borg extract --progress "$BACKUP_DIR::$archive" var/lib/docker; then
-    log "ERROR" "Failed to extract archive"
-    echo -e "${COLOR_RED}ERROR: Failed to extract archive${COLOR_RESET}"
-    start_docker
-    exit 1
+  # The main issue was with the path extraction. Let's verify the path structure first
+  log "INFO" "Verifying archive structure"
+  local archive_contents=$(borg list --format="{path}{NL}" "$BACKUP_DIR::$archive")
+
+  if echo "$archive_contents" | grep -q "^var/lib/docker"; then
+    # Archive has paths with leading directories (absolute paths were preserved)
+    log "INFO" "Archive contains absolute paths. Extracting from root directory"
+    cd /
+    if ! borg extract --progress "$BACKUP_DIR::$archive" "var/lib/docker"; then
+      log "ERROR" "Failed to extract archive"
+      echo -e "${COLOR_RED}ERROR: Failed to extract archive${COLOR_RESET}"
+      start_docker
+      cleanup_and_exit 1
+    fi
+  else
+    # Archive likely has direct docker directory structure without leading paths
+    log "INFO" "Archive contains relative paths. Extracting directly to Docker directory"
+    if ! borg extract --progress --strip-components 1 "$BACKUP_DIR::$archive" --target-dir "$DOCKER_DIR"; then
+      log "ERROR" "Failed to extract archive"
+      echo -e "${COLOR_RED}ERROR: Failed to extract archive${COLOR_RESET}"
+      start_docker
+      cleanup_and_exit 1
+    fi
   fi
 
   local end_time=$(date +%s)
@@ -572,18 +778,24 @@ restore_archive() {
 
   # Verify Docker is running properly
   log "INFO" "Verifying Docker restored correctly"
-  if ! docker info >/dev/null 2>&1; then
-    log "ERROR" "Docker failed to start properly after restoration"
-    echo -e "${COLOR_RED}ERROR: Docker failed to start properly after restoration${COLOR_RESET}"
+  if verify_docker_functionality; then
+    log "INFO" "Restore operation completed successfully"
+    echo -e "${COLOR_GREEN}${COLOR_BOLD}Restore completed successfully!${COLOR_RESET}"
+    RESTORE_SUCCESS=true
+
+    if [ "$KEEP_BACKUP" = true ]; then
+      echo -e "${COLOR_CYAN}Your previous Docker directory was backed up to: $BACKUP_DIR_NAME${COLOR_RESET}"
+    else
+      echo -e "${COLOR_CYAN}Your previous Docker directory backup will be removed automatically${COLOR_RESET}"
+    fi
+
+    return 0
+  else
+    log "ERROR" "Docker is not functioning correctly after restore"
+    echo -e "${COLOR_RED}ERROR: Docker is not functioning correctly after restore${COLOR_RESET}"
     echo -e "${COLOR_YELLOW}You may need to restore from a different backup or check Docker logs${COLOR_RESET}"
     return 1
   fi
-
-  log "INFO" "Restore operation completed successfully"
-  echo -e "${COLOR_GREEN}${COLOR_BOLD}Restore completed successfully!${COLOR_RESET}"
-  echo -e "${COLOR_CYAN}Your previous Docker directory was backed up to: ${DOCKER_DIR}.bak.*${COLOR_RESET}"
-
-  return 0
 }
 
 # Function to display a nice header
@@ -600,6 +812,9 @@ main() {
   display_header
 
   log "INFO" "Starting Docker full restore process"
+
+  # Obtain lock to prevent multiple instances running
+  obtain_lock
 
   # Check prerequisites
   check_borg_installation
@@ -622,13 +837,13 @@ main() {
     if [ "$choice" -eq 0 ]; then
       log "INFO" "Restore canceled by user"
       echo -e "${COLOR_GREEN}Restore canceled.${COLOR_RESET}"
-      exit 0
+      cleanup_and_exit 0
     fi
 
     if [ "$choice" -lt 1 ] || [ "$choice" -gt "${#ARCHIVES[@]}" ]; then
       log "ERROR" "Invalid selection: $choice"
       echo -e "${COLOR_RED}ERROR: Invalid selection${COLOR_RESET}"
-      exit 1
+      cleanup_and_exit 1
     fi
 
     archive_to_restore="${ARCHIVES[$((choice - 1))]}"
@@ -643,22 +858,24 @@ main() {
     if [ "$confirm" != "yes" ]; then
       log "INFO" "Restore canceled by user"
       echo -e "${COLOR_GREEN}Restore canceled.${COLOR_RESET}"
-      exit 0
+      cleanup_and_exit 0
     fi
   fi
 
   # Perform the restoration
   restore_archive "$archive_to_restore"
+  local restore_status=$?
 
-  return 0
+  # Cleanup based on the restore result
+  cleanup_on_exit $restore_status
+  exit $restore_status
 }
 
 # Register trap for cleanup
-trap cleanup_on_exit EXIT INT TERM
+trap 'cleanup_on_exit 1' INT TERM
 
 # Ensure log directory exists
 ensure_log_directory
 
 # Run the main function
 main
-exit $?

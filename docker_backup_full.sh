@@ -36,12 +36,14 @@ fi
 DEFAULT_BACKUP_DIR="/backup/docker"
 DEFAULT_RETENTION_DAYS="30"
 DEFAULT_COMPRESSION="lz4" # Fastest compression
+DEFAULT_ENCRYPTION="none" # Default no encryption
 DOCKER_DIR="/var/lib/docker"
 LOG_DIR="/var/log/docker"
 LOG_FILE="${LOG_DIR}/backup.log"
 DOCKER_SERVICE="docker.service"
 DOCKER_SOCKET="docker.socket"
 CHECK_AFTER_BACKUP=true
+LOCK_FILE="/var/lock/docker_backup_full.lock"
 
 # Color definitions
 COLOR_RESET="\033[0m"
@@ -54,10 +56,10 @@ COLOR_CYAN="\033[0;36m"
 COLOR_WHITE="\033[0;37m"
 COLOR_BOLD="\033[1m"
 
-# Flag to track if we stopped docker
+# Flag to track Docker service states
 DOCKER_STOPPED=false
-# Flag to track if we restarted docker
 DOCKER_RESTARTED=false
+BACKUP_SUCCESS=false
 
 # Parse command line arguments
 usage() {
@@ -68,14 +70,17 @@ usage() {
     echo -e "  ${COLOR_GREEN}-d, --directory DIR${COLOR_RESET}    Backup directory (default: $DEFAULT_BACKUP_DIR)"
     echo -e "  ${COLOR_GREEN}-r, --retention DAYS${COLOR_RESET}   Number of days to keep backups (default: $DEFAULT_RETENTION_DAYS)"
     echo -e "  ${COLOR_GREEN}-c, --compression TYPE${COLOR_RESET} Compression type (lz4, zstd, zlib, none; default: $DEFAULT_COMPRESSION)"
+    echo -e "  ${COLOR_GREEN}-e, --encryption TYPE${COLOR_RESET}  Encryption type (none, repokey, keyfile; default: $DEFAULT_ENCRYPTION)"
     echo -e "  ${COLOR_GREEN}-f, --force${COLOR_RESET}            Don't ask for confirmation"
     echo -e "  ${COLOR_GREEN}-s, --skip-check${COLOR_RESET}       Skip integrity check after backup"
+    echo -e "  ${COLOR_GREEN}-k, --keep-old${COLOR_RESET}         Keep Docker service stopped after backup (useful for maintenance)"
     echo -e "  ${COLOR_GREEN}-h, --help${COLOR_RESET}             Display this help message"
     echo ""
     echo -e "${COLOR_CYAN}Environment variables:${COLOR_RESET}"
     echo -e "  ${COLOR_GREEN}DOCKER_BACKUP_DIR${COLOR_RESET}      Same as --directory"
     echo -e "  ${COLOR_GREEN}DOCKER_RETENTION_DAYS${COLOR_RESET}  Same as --retention"
     echo -e "  ${COLOR_GREEN}DOCKER_COMPRESSION${COLOR_RESET}     Same as --compression"
+    echo -e "  ${COLOR_GREEN}DOCKER_ENCRYPTION${COLOR_RESET}      Same as --encryption"
     exit 1
 }
 
@@ -83,7 +88,9 @@ usage() {
 BACKUP_DIR=${DOCKER_BACKUP_DIR:-$DEFAULT_BACKUP_DIR}
 RETENTION_DAYS=${DOCKER_RETENTION_DAYS:-$DEFAULT_RETENTION_DAYS}
 COMPRESSION=${DOCKER_COMPRESSION:-$DEFAULT_COMPRESSION}
+ENCRYPTION=${DOCKER_ENCRYPTION:-$DEFAULT_ENCRYPTION}
 FORCE=false
+KEEP_DOCKER_STOPPED=false
 
 # Parse command line options
 while [[ $# -gt 0 ]]; do
@@ -108,12 +115,24 @@ while [[ $# -gt 0 ]]; do
         fi
         shift 2
         ;;
+    -e | --encryption)
+        ENCRYPTION="$2"
+        if ! [[ "$ENCRYPTION" =~ ^(none|repokey|keyfile)$ ]]; then
+            echo -e "${COLOR_RED}ERROR: Encryption must be one of: none, repokey, keyfile${COLOR_RESET}"
+            exit 1
+        fi
+        shift 2
+        ;;
     -f | --force)
         FORCE=true
         shift
         ;;
     -s | --skip-check)
         CHECK_AFTER_BACKUP=false
+        shift
+        ;;
+    -k | --keep-old)
+        KEEP_DOCKER_STOPPED=true
         shift
         ;;
     -h | --help)
@@ -126,25 +145,78 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Exit handlers
+cleanup_and_exit() {
+    local exit_code=$1
+
+    # Release lock file
+    if [ -f "$LOCK_FILE" ]; then
+        rm -f "$LOCK_FILE"
+        log "INFO" "Released lock file"
+    fi
+
+    # Ensure descriptors are closed
+    exec 3>&- 4>&- 2>&- 1>&-
+
+    exit $exit_code
+}
+
+# Obtain a lock file to prevent multiple instances
+obtain_lock() {
+    log "INFO" "Attempting to obtain lock"
+
+    # Check if lock file exists and if process is still running
+    if [ -f "$LOCK_FILE" ]; then
+        local pid=$(cat "$LOCK_FILE")
+        if ps -p "$pid" >/dev/null 2>&1; then
+            log "ERROR" "Another backup process is already running (PID: $pid)"
+            echo -e "${COLOR_RED}ERROR: Another backup process is already running (PID: $pid)${COLOR_RESET}"
+            echo -e "${COLOR_YELLOW}If you're sure no other backup is running, remove the lock file:${COLOR_RESET}"
+            echo -e "${COLOR_CYAN}sudo rm -f $LOCK_FILE${COLOR_RESET}"
+            cleanup_and_exit 1
+        else
+            log "WARNING" "Stale lock file found. Removing it."
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+
+    # Create lock file with current PID
+    echo $$ >"$LOCK_FILE"
+
+    # Verify lock was obtained
+    if [ ! -f "$LOCK_FILE" ] || [ "$(cat "$LOCK_FILE")" != "$$" ]; then
+        log "ERROR" "Failed to create lock file"
+        echo -e "${COLOR_RED}ERROR: Failed to create lock file${COLOR_RESET}"
+        cleanup_and_exit 1
+    fi
+
+    log "INFO" "Lock obtained successfully"
+}
+
 # Setup logging
 ensure_log_directory() {
     if [ ! -d "$LOG_DIR" ]; then
         mkdir -p "$LOG_DIR"
         if [ $? -ne 0 ]; then
             echo -e "${COLOR_RED}ERROR: Failed to create log directory $LOG_DIR${COLOR_RESET}"
-            echo -e "${COLOR_YELLOW}Run the following commands to create the directory with correct permissions:${COLOR_RESET}"
+            echo -e "${COLOR_YELLOW}Run the following command to create the directory with correct permissions:${COLOR_RESET}"
             echo -e "${COLOR_CYAN}sudo mkdir -p $LOG_DIR${COLOR_RESET}"
-            echo -e "${COLOR_CYAN}sudo chown $USER:$USER $LOG_DIR${COLOR_RESET}"
-            exit 1
+            cleanup_and_exit 1
         fi
+
+        # Set proper permissions for log directory
+        chmod 750 "$LOG_DIR"
     fi
 
     if [ ! -f "$LOG_FILE" ]; then
         touch "$LOG_FILE"
         if [ $? -ne 0 ]; then
             echo -e "${COLOR_RED}ERROR: Failed to create log file $LOG_FILE${COLOR_RESET}"
-            exit 1
+            cleanup_and_exit 1
         fi
+
+        # Set proper permissions for log file
+        chmod 640 "$LOG_FILE"
     fi
 }
 
@@ -187,8 +259,8 @@ check_borg_installation() {
     if ! command_exists borg; then
         log "ERROR" "Borg Backup is not installed"
 
-        # Verifica se lo script di installazione è disponibile
-        local install_script="/usr/local/bin/docker_install.sh"
+        # Check if installation script is available
+        local install_script="/usr/local/bin/docker_install"
         local repo_install_script="./docker_install.sh"
 
         if [ -f "$install_script" ]; then
@@ -199,20 +271,20 @@ check_borg_installation() {
                     log "INFO" "Running installation script"
                     "$install_script"
 
-                    # Verifica se l'installazione ha avuto successo
+                    # Check if installation was successful
                     if ! command_exists borg; then
                         log "ERROR" "Installation failed. Borg is still not available."
-                        exit 1
+                        cleanup_and_exit 1
                     else
                         log "INFO" "Borg installed successfully"
                         return 0
                     fi
                 else
                     log "INFO" "Backup canceled because Borg is not installed"
-                    exit 1
+                    cleanup_and_exit 1
                 fi
             else
-                exit 1
+                cleanup_and_exit 1
             fi
         elif [ -f "$repo_install_script" ]; then
             echo -e "${COLOR_YELLOW}Would you like to run the installation script? ($repo_install_script)${COLOR_RESET}"
@@ -222,20 +294,20 @@ check_borg_installation() {
                     log "INFO" "Running installation script"
                     "$repo_install_script"
 
-                    # Verifica se l'installazione ha avuto successo
+                    # Check if installation was successful
                     if ! command_exists borg; then
                         log "ERROR" "Installation failed. Borg is still not available."
-                        exit 1
+                        cleanup_and_exit 1
                     else
                         log "INFO" "Borg installed successfully"
                         return 0
                     fi
                 else
                     log "INFO" "Backup canceled because Borg is not installed"
-                    exit 1
+                    cleanup_and_exit 1
                 fi
             else
-                exit 1
+                cleanup_and_exit 1
             fi
         else
             echo -e "${COLOR_RED}Installation script not found.${COLOR_RESET}"
@@ -243,7 +315,7 @@ check_borg_installation() {
             echo -e "${COLOR_CYAN}git clone https://github.com/domresc/docker-volume-tools.git${COLOR_RESET}"
             echo -e "${COLOR_CYAN}cd docker-volume-tools${COLOR_RESET}"
             echo -e "${COLOR_CYAN}sudo bash docker_install.sh${COLOR_RESET}"
-            exit 1
+            cleanup_and_exit 1
         fi
     fi
 
@@ -264,30 +336,43 @@ initialize_repository() {
         if [ $? -ne 0 ]; then
             log "ERROR" "Failed to create backup directory $BACKUP_DIR"
             echo -e "${COLOR_RED}ERROR: Failed to create backup directory $BACKUP_DIR${COLOR_RESET}"
-            echo -e "${COLOR_YELLOW}Run the following commands to create the directory with correct permissions:${COLOR_RESET}"
+            echo -e "${COLOR_YELLOW}Run the following command to create the directory with correct permissions:${COLOR_RESET}"
             echo -e "${COLOR_CYAN}sudo mkdir -p $BACKUP_DIR${COLOR_RESET}"
-            echo -e "${COLOR_CYAN}sudo chown $USER:$USER $BACKUP_DIR${COLOR_RESET}"
-            exit 1
+            cleanup_and_exit 1
         fi
+
+        # Set proper permissions
+        chmod 750 "$BACKUP_DIR"
     fi
 
     # Check if the directory is a borg repository
     if ! borg info "$BACKUP_DIR" >/dev/null 2>&1; then
-        log "INFO" "Initializing new Borg repository in $BACKUP_DIR"
+        log "INFO" "Initializing new Borg repository in $BACKUP_DIR with encryption: $ENCRYPTION"
 
         if [ "$FORCE" != "true" ]; then
-            read -p "$(echo -e "${COLOR_YELLOW}Initialize new Borg repository in $BACKUP_DIR? (y/n): ${COLOR_RESET}")" init_repo
+            read -p "$(echo -e "${COLOR_YELLOW}Initialize new Borg repository in $BACKUP_DIR with encryption: $ENCRYPTION? (y/n): ${COLOR_RESET}")" init_repo
             if [ "$init_repo" != "y" ]; then
                 log "INFO" "Backup canceled by user"
-                exit 0
+                cleanup_and_exit 0
             fi
         fi
 
-        borg init --encryption=none "$BACKUP_DIR"
+        # Create repository with specified encryption
+        if [ "$ENCRYPTION" = "none" ]; then
+            borg init --encryption=none "$BACKUP_DIR"
+        else
+            echo -e "${COLOR_YELLOW}You selected encryption type: $ENCRYPTION${COLOR_RESET}"
+            echo -e "${COLOR_YELLOW}You will be prompted to create a passphrase for the repository.${COLOR_RESET}"
+            echo -e "${COLOR_YELLOW}IMPORTANT: Keep your passphrase safe. If lost, backups cannot be recovered!${COLOR_RESET}"
+
+            # Create repository with encryption
+            borg init --encryption=$ENCRYPTION "$BACKUP_DIR"
+        fi
+
         if [ $? -ne 0 ]; then
             log "ERROR" "Failed to initialize Borg repository"
             echo -e "${COLOR_RED}ERROR: Failed to initialize Borg repository${COLOR_RESET}"
-            exit 1
+            cleanup_and_exit 1
         fi
         log "INFO" "Borg repository initialized successfully"
     else
@@ -295,16 +380,34 @@ initialize_repository() {
     fi
 }
 
-# Check disk space
+# Check disk space for new or incremental backup
 check_disk_space() {
+    log "INFO" "Checking disk space"
+
+    # Get Docker directory size
     local docker_size=$(du -sm "$DOCKER_DIR" 2>/dev/null | cut -f1)
     if [ -z "$docker_size" ]; then
         log "WARNING" "Could not determine Docker directory size. Make sure you have sufficient disk space."
         return 0
     fi
 
-    # Add 10% overhead
-    local needed_space=$((docker_size + (docker_size / 10)))
+    # Check if previous backups exist for calculation
+    local has_previous_backup=false
+    if borg list --short "$BACKUP_DIR" >/dev/null 2>&1; then
+        has_previous_backup=true
+    fi
+
+    # Calculate needed space based on whether this is first backup or incremental
+    local needed_space
+    if [ "$has_previous_backup" = true ]; then
+        # For incremental backups, estimate 25% of Docker dir size
+        needed_space=$((docker_size / 4))
+        log "INFO" "Incremental backup detected - estimating space needed"
+    else
+        # For first backup, full size + 10% overhead
+        needed_space=$((docker_size + (docker_size / 10)))
+        log "INFO" "First backup detected - will need full Docker directory size"
+    fi
 
     # Get available space
     local available_space=$(df -m "$BACKUP_DIR" | awk 'NR==2 {print $4}')
@@ -320,7 +423,7 @@ check_disk_space() {
             read -p "$(echo -e "${COLOR_YELLOW}Available space may be insufficient. Continue anyway? (y/n): ${COLOR_RESET}")" confirm
             if [ "$confirm" != "y" ]; then
                 log "INFO" "Backup canceled by user due to space concerns"
-                exit 0
+                cleanup_and_exit 0
             fi
         else
             log "WARNING" "Continuing despite potential space issues due to force flag"
@@ -331,65 +434,93 @@ check_disk_space() {
 # Manage Docker service (start/stop) with compatibility for different init systems
 manage_docker_service() {
     local action="$1" # 'start' or 'stop'
+    local max_attempts=3
+    local attempt=1
+    local success=false
 
-    # Verify which init system is in use
-    if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
-        # systemd
-        log "INFO" "Using systemd to $action Docker"
-        if [ "$action" = "stop" ]; then
-            systemctl $action $DOCKER_SOCKET
-            systemctl $action $DOCKER_SERVICE
+    while [ $attempt -le $max_attempts ] && [ "$success" = false ]; do
+        log "INFO" "Attempt $attempt to $action Docker service"
+
+        # Detect init system and act accordingly
+        if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+            # systemd
+            log "INFO" "Using systemd to $action Docker"
+            if [ "$action" = "stop" ]; then
+                systemctl stop $DOCKER_SOCKET
+                systemctl stop $DOCKER_SERVICE
+            else
+                systemctl start $DOCKER_SERVICE
+                systemctl start $DOCKER_SOCKET
+            fi
+        elif command -v service >/dev/null 2>&1; then
+            # SysV init or upstart
+            log "INFO" "Using service command to $action Docker"
+            service docker $action
+        elif [ -f /etc/init.d/docker ]; then
+            # SysV init script direct
+            log "INFO" "Using init.d script to $action Docker"
+            /etc/init.d/docker $action
         else
-            systemctl $action $DOCKER_SERVICE
-            systemctl $action $DOCKER_SOCKET
+            # Fallback to direct commands
+            if [ "$action" = "stop" ]; then
+                log "INFO" "Using killall to stop Docker"
+                if command -v killall >/dev/null 2>&1; then
+                    killall -TERM dockerd
+                else
+                    log "WARNING" "killall not found, trying pkill"
+                    pkill -TERM dockerd
+                fi
+            else
+                log "INFO" "Starting Docker daemon directly"
+                if [ -x "$(command -v dockerd)" ]; then
+                    dockerd &
+                else
+                    log "ERROR" "dockerd command not found"
+                    return 1
+                fi
+            fi
         fi
-    elif command -v service >/dev/null 2>&1; then
-        # SysV init or upstart
-        log "INFO" "Using service command to $action Docker"
-        service docker $action
-    elif [ -f /etc/init.d/docker ]; then
-        # SysV init script direct
-        log "INFO" "Using init.d script to $action Docker"
-        /etc/init.d/docker $action
-    else
-        # Fallback to direct commands
-        if [ "$action" = "stop" ]; then
-            log "INFO" "Using killall to stop Docker"
-            killall -TERM dockerd
+
+        # Verify the operation status
+        local max_wait=30
+        local counter=0
+        local expected_status=$([[ "$action" = "start" ]] && echo "running" || echo "stopped")
+
+        while [ $counter -lt $max_wait ]; do
+            sleep 1
+            counter=$((counter + 1))
+
+            if docker info >/dev/null 2>&1; then
+                local current_status="running"
+            else
+                local current_status="stopped"
+            fi
+
+            if [ "$current_status" = "$expected_status" ]; then
+                success=true
+                break
+            fi
+        done
+
+        if [ "$success" = true ]; then
+            log "INFO" "Docker service $action successfully"
+            return 0
         else
-            log "INFO" "Starting Docker daemon directly"
-            dockerd &
-        fi
-    fi
+            log "WARNING" "Failed to $action Docker service on attempt $attempt"
+            attempt=$((attempt + 1))
 
-    # Verify the operation status
-    local max_wait=30
-    local counter=0
-    local expected_status=$([[ "$action" = "start" ]] && echo "running" || echo "stopped")
-
-    while true; do
-        sleep 1
-        counter=$((counter + 1))
-
-        if docker info >/dev/null 2>&1; then
-            local current_status="running"
-        else
-            local current_status="stopped"
-        fi
-
-        if [ "$current_status" = "$expected_status" ]; then
-            break
-        fi
-
-        if [ $counter -ge $max_wait ]; then
-            log "ERROR" "Failed to $action Docker service within $max_wait seconds"
-            echo -e "${COLOR_RED}ERROR: Failed to $action Docker service${COLOR_RESET}"
-            return 1
+            # Wait before retrying
+            if [ $attempt -le $max_attempts ]; then
+                log "INFO" "Waiting 5 seconds before next attempt..."
+                sleep 5
+            fi
         fi
     done
 
-    log "INFO" "Docker service $action successfully"
-    return 0
+    # If we got here, all attempts failed
+    log "ERROR" "Failed to $action Docker service after $max_attempts attempts"
+    echo -e "${COLOR_RED}ERROR: Failed to $action Docker service${COLOR_RESET}"
+    return 1
 }
 
 # Stop Docker service
@@ -399,6 +530,7 @@ stop_docker() {
     # Check if Docker is running
     if ! docker info >/dev/null 2>&1; then
         log "INFO" "Docker service is already stopped"
+        DOCKER_STOPPED=true
         return 0
     fi
 
@@ -407,7 +539,7 @@ stop_docker() {
         read -p "$(echo -e "${COLOR_YELLOW}Are you sure you want to continue? (y/n): ${COLOR_RESET}")" confirm
         if [ "$confirm" != "y" ]; then
             log "INFO" "Backup canceled by user"
-            exit 0
+            cleanup_and_exit 0
         fi
     fi
 
@@ -419,13 +551,13 @@ stop_docker() {
         DOCKER_STOPPED=true
     else
         echo -e "${COLOR_RED}ERROR: Failed to stop Docker service${COLOR_RESET}"
-        exit 1
+        cleanup_and_exit 1
     fi
 }
 
 # Start Docker service
 start_docker() {
-    if [ "$DOCKER_STOPPED" = true ]; then
+    if [ "$DOCKER_STOPPED" = true ] && [ "$KEEP_DOCKER_STOPPED" != true ]; then
         log "INFO" "Starting Docker service"
         manage_docker_service start
         local start_result=$?
@@ -436,8 +568,12 @@ start_docker() {
             echo -e "${COLOR_YELLOW}You may need to start it manually with: sudo systemctl start $DOCKER_SERVICE${COLOR_RESET}"
             return 1
         fi
-        # Aggiungi questa riga per tenere traccia del riavvio
         DOCKER_RESTARTED=true
+        log "INFO" "Docker service started successfully"
+    elif [ "$KEEP_DOCKER_STOPPED" = true ]; then
+        log "INFO" "Keeping Docker service stopped as requested"
+        echo -e "${COLOR_YELLOW}Docker service has been kept stopped as requested${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}You will need to start it manually with: sudo systemctl start $DOCKER_SERVICE${COLOR_RESET}"
     else
         log "INFO" "Docker was not stopped, no need to start it"
     fi
@@ -453,13 +589,31 @@ create_backup() {
     log "INFO" "Creating backup $backup_name"
     echo -e "${COLOR_CYAN}${COLOR_BOLD}Creating backup in progress. This may take some time...${COLOR_RESET}"
 
-    # Run the backup
-    borg create \
-        --stats \
-        --progress \
-        --compression $COMPRESSION \
-        "$BACKUP_DIR::$backup_name" \
-        "$DOCKER_DIR"
+    # Create environment variables for encryption passphrase if needed
+    local export_vars=""
+    if [ "$ENCRYPTION" != "none" ]; then
+        export_vars="BORG_PASSPHRASE"
+        echo -e "${COLOR_YELLOW}You will be prompted for the repository passphrase.${COLOR_RESET}"
+    fi
+
+    # Run the backup with proper environment variables
+    if [ -n "$export_vars" ]; then
+        # With encryption
+        borg create \
+            --stats \
+            --progress \
+            --compression $COMPRESSION \
+            "$BACKUP_DIR::$backup_name" \
+            "$DOCKER_DIR"
+    else
+        # Without encryption
+        borg create \
+            --stats \
+            --progress \
+            --compression $COMPRESSION \
+            "$BACKUP_DIR::$backup_name" \
+            "$DOCKER_DIR"
+    fi
 
     local backup_exit_code=$?
     local end_time=$(date +%s)
@@ -467,6 +621,7 @@ create_backup() {
 
     if [ $backup_exit_code -eq 0 ]; then
         log "INFO" "Backup completed successfully in $duration seconds"
+        BACKUP_SUCCESS=true
         return 0
     else
         log "ERROR" "Backup failed with exit code $backup_exit_code"
@@ -480,6 +635,11 @@ verify_backup() {
 
     log "INFO" "Verifying backup $backup_name"
     echo -e "${COLOR_CYAN}${COLOR_BOLD}Verifying backup...${COLOR_RESET}"
+
+    # Handle encryption if needed
+    if [ "$ENCRYPTION" != "none" ]; then
+        echo -e "${COLOR_YELLOW}You will be prompted for the repository passphrase.${COLOR_RESET}"
+    fi
 
     borg check --progress "$BACKUP_DIR::$backup_name"
 
@@ -504,6 +664,11 @@ prune_old_backups() {
     log "INFO" "Pruning backups older than $RETENTION_DAYS days"
     echo -e "${COLOR_CYAN}${COLOR_BOLD}Pruning old backups...${COLOR_RESET}"
 
+    # Handle encryption if needed
+    if [ "$ENCRYPTION" != "none" ]; then
+        echo -e "${COLOR_YELLOW}You will be prompted for the repository passphrase.${COLOR_RESET}"
+    fi
+
     borg prune \
         --keep-daily $RETENTION_DAYS \
         --stats \
@@ -524,11 +689,9 @@ prune_old_backups() {
 cleanup_on_exit() {
     log "INFO" "Running cleanup on exit"
 
-    # Make sure Docker is running
-    if [ "$DOCKER_STOPPED" = true ] && [ "$DOCKER_RESTARTED" != true ]; then
+    # Make sure Docker is running unless --keep-old was specified
+    if [ "$DOCKER_STOPPED" = true ] && [ "$DOCKER_RESTARTED" != true ] && [ "$KEEP_DOCKER_STOPPED" != true ]; then
         start_docker
-    else
-        log "INFO" "Docker already restarted, skipping restart in cleanup"
     fi
 
     log "INFO" "Cleanup completed"
@@ -549,6 +712,9 @@ perform_backup() {
 
     log "INFO" "Starting Docker Volume Full Backup"
 
+    # Obtain lock to prevent multiple instances running
+    obtain_lock
+
     # Check prerequisites
     check_borg_installation
     initialize_repository
@@ -563,10 +729,12 @@ perform_backup() {
     create_result=$?
 
     # Get the name of the latest backup
-    local latest_backup=$(borg list --last 1 --short "$BACKUP_DIR" | cut -d' ' -f1)
+    local latest_backup=$(borg list --last 1 --short "$BACKUP_DIR" | head -1)
 
-    # Start Docker regardless of backup success/failure
-    start_docker
+    # Start Docker unless requested to keep it stopped
+    if [ "$KEEP_DOCKER_STOPPED" != true ]; then
+        start_docker
+    fi
 
     # Check backup if requested and if backup succeeded
     if [ "$CHECK_AFTER_BACKUP" = true ] && [ $create_result -eq 0 ]; then
@@ -578,8 +746,19 @@ perform_backup() {
 
     # Show backup summary
     local total_backups=$(borg list "$BACKUP_DIR" | wc -l)
-    local repo_size=$(borg info --json "$BACKUP_DIR" | grep '"unique_csize":[0-9]*' | cut -d':' -f2)
-    repo_size=$((repo_size / 1024 / 1024)) # Convert to MB
+    local repo_info=$(borg info --json "$BACKUP_DIR" 2>/dev/null)
+    local repo_size=0
+
+    if [ -n "$repo_info" ]; then
+        repo_size=$(echo "$repo_info" | grep -o '"unique_csize":[0-9]*' | grep -o '[0-9]*')
+        if [ -n "$repo_size" ]; then
+            repo_size=$((repo_size / 1024 / 1024)) # Convert to MB
+        else
+            repo_size="Unknown"
+        fi
+    else
+        repo_size="Unknown"
+    fi
 
     echo -e "${COLOR_CYAN}${COLOR_BOLD}"
     echo "======================================================="
@@ -590,6 +769,7 @@ perform_backup() {
     log "INFO" "Repository size: $repo_size MB"
     log "INFO" "Latest backup: $latest_backup"
     log "INFO" "Compression: $COMPRESSION"
+    log "INFO" "Encryption: $ENCRYPTION"
     log "INFO" "Retention: $RETENTION_DAYS days"
 
     if [ $create_result -eq 0 ]; then
@@ -599,10 +779,10 @@ perform_backup() {
     fi
 
     if [ $create_result -ne 0 ]; then
-        return 1
+        cleanup_and_exit 1
     fi
 
-    return 0
+    cleanup_and_exit 0
 }
 
 # Register trap for cleanup
@@ -613,4 +793,3 @@ ensure_log_directory
 
 # Run the backup
 perform_backup
-exit $?
