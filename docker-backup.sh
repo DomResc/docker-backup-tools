@@ -103,7 +103,7 @@ send_email() {
             msmtp_args+=(--user="$EMAIL_SMTP_USER")
         fi
         if [ -n "$EMAIL_SMTP_PASSWORD" ]; then
-            msmtp_args+=(--passwordeval="echo $EMAIL_SMTP_PASSWORD")
+            msmtp_args+=(--password="$EMAIL_SMTP_PASSWORD")
         fi
         if [ "$EMAIL_SMTP_TLS" = true ]; then
             msmtp_args+=(--tls=on --tls-starttls=on)
