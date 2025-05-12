@@ -9,6 +9,7 @@ A robust Bash script for backing up Docker data directories using Borg backup wi
 - **Smart Retention Policy**: Configurable retention for daily, weekly, monthly, and yearly backups
 - **Remote Synchronization**: Optional synchronization to remote storage using Filen
 - **Download Capability**: Download repository directly from Filen remote storage
+- **Docker Cleanup**: Configurable pruning of Docker resources (containers, images, networks, volumes)
 - **Email Notifications**: Configurable email alerts for success and/or failure
 - **Progress Monitoring**: Interactive progress bar when running manually
 - **Error Handling**: Comprehensive error handling with automatic service recovery
@@ -68,6 +69,15 @@ EMAIL_SMTP_PORT="587"                      # SMTP port
 EMAIL_SMTP_USER=""                         # SMTP username
 EMAIL_SMTP_PASSWORD=""                     # SMTP password
 EMAIL_SMTP_TLS=true                        # Use TLS for SMTP
+```
+
+### Docker Cleanup Configuration
+
+```bash
+DOCKER_CLEANUP_ENABLED=false     # Enable Docker cleanup during cleanup operation
+DOCKER_PRUNE_ALL_IMAGES=false    # When true, removes all unused images (not just dangling)
+DOCKER_SYSTEM_PRUNE=false        # Enable more aggressive system-wide cleanup
+DOCKER_PRUNE_VOLUMES=false       # Enable removal of unused volumes (use with caution)
 ```
 
 ### Mode Configuration
@@ -139,17 +149,30 @@ Restore a specific backup:
 sudo ./docker-backup.sh -c /etc/docker-backup/config.conf --restore docker-2023-05-15_02:00:00
 ```
 
+Run Docker cleanup with backup maintenance:
+
+```bash
+sudo ./docker-backup.sh -c /etc/docker-backup/config.conf --cleanup
+```
+
 Download backup repository from remote storage:
 
 ```bash
 sudo ./docker-backup.sh -c /etc/docker-backup/config.conf --download
 ```
 
-Clean up and enforce retention policy:
+## Docker Cleanup
 
-```bash
-sudo ./docker-backup.sh -c /etc/docker-backup/config.conf --cleanup
-```
+The Docker cleanup functionality allows you to clean unused resources during the cleanup operation:
+
+1. Set `DOCKER_CLEANUP_ENABLED=true` to activate Docker cleanup
+2. Configure the level of cleanup:
+   - Basic cleanup (default): Removes stopped containers and dangling images/networks
+   - Full image cleanup (`DOCKER_PRUNE_ALL_IMAGES=true`): Removes all unused images, including tagged ones
+   - Volume cleanup (`DOCKER_PRUNE_VOLUMES=true`): Removes unused volumes (use with caution!)
+   - System cleanup (`DOCKER_SYSTEM_PRUNE=true`): Performs a system-wide cleanup
+
+These settings can be combined for customized cleanup behavior.
 
 ## Scheduling with Cron
 
@@ -180,6 +203,7 @@ Common issues:
 - **Docker not stopping**: Check Docker service status and dependencies
 - **Lock file exists**: If the script was interrupted abnormally, you might need to manually remove the lock directory at `/tmp/docker-backup.lock`
 - **Email notifications not working**: Verify SMTP settings and connectivity
+- **Docker cleanup failures**: Ensure Docker is running during cleanup operations; check for active containers using volumes if volume cleanup fails
 
 ## Security Notes
 
@@ -189,3 +213,4 @@ Common issues:
 - Temporary files containing sensitive information (like SMTP passwords) are created with strict permissions (600)
 - Ensure your backup directory has appropriate permissions
 - The lock mechanism uses a directory-based approach for improved atomicity
+- Docker cleanup operations may affect running services; use the volume cleanup option (`DOCKER_PRUNE_VOLUMES=true`) with extreme caution in production environments
