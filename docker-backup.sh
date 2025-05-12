@@ -599,25 +599,18 @@ cleanup() {
 
 # Function to download backup from Filen
 download_backup() {
-    local archive="$1"
-
-    if [ -z "$archive" ]; then
-        handle_error "No archive specified for download"
-    fi
-
-    log "Starting download of backup archive: $archive from Filen"
+    log "Starting download of backup repository from Filen"
 
     # Check if Filen is available
     if ! command -v filen &>/dev/null; then
         handle_error "Filen client not installed. Please install it to download backups."
     fi
 
-    # Check if backup directory exists locally
-    if [ ! -d "$BACKUP_DIR" ]; then
-        log "Creating local backup directory"
-        if ! mkdir -p "$BACKUP_DIR"; then
-            handle_error "Unable to create local backup directory"
-        fi
+    # Create a temporary directory for the download
+    local temp_download_dir
+    temp_download_dir=$(mktemp -d)
+    if [ ! -d "$temp_download_dir" ]; then
+        handle_error "Unable to create temporary download directory"
     fi
 
     # Create lock file to prevent multiple executions
@@ -631,27 +624,73 @@ download_backup() {
             rm -f "$LOCK_FILE"
         fi
     fi
-    echo $$ >"$LOCK_FILE"
+    echo $ >"$LOCK_FILE"
 
     # Temporary file for email report
     EMAIL_TEMP_FILE=$(mktemp)
     BACKUP_SUCCESS=true
     BACKUP_START_TIME=$(date +%s)
 
-    # Check if the archive exists in remote storage
-    log "Verifying archive exists in remote storage"
-    if ! filen ls "$REMOTE_DEST/$archive" &>/dev/null; then
-        handle_error "Archive $archive not found in remote storage"
+    # Verify remote location exists
+    log "Verifying remote backup location exists"
+    if ! filen ls "$REMOTE_DEST" &>/dev/null; then
+        handle_error "Remote backup location not found in Filen storage"
     fi
 
-    # Download the backup
-    log "Downloading archive from remote storage"
-    if ! filen download "$REMOTE_DEST/$archive" "$BACKUP_DIR"; then
-        handle_error "Failed to download archive from remote storage"
+    # Check if local backup directory exists
+    if [ -d "$BACKUP_DIR" ]; then
+        log "Backup directory already exists locally, creating backup of it"
+        local date_suffix
+        date_suffix=$(date +%Y%m%d%H%M%S)
+        local backup_dir_backup="$BACKUP_DIR.bak.$date_suffix"
+
+        if ! mv "$BACKUP_DIR" "$backup_dir_backup"; then
+            handle_error "Unable to backup existing backup directory"
+        fi
+        log "Existing backup directory moved to $backup_dir_backup"
+    fi
+
+    # Create new backup directory
+    if ! mkdir -p "$BACKUP_DIR"; then
+        handle_error "Unable to create local backup directory"
+    fi
+
+    # Download the backup repository
+    log "Downloading backup repository from remote storage"
+    if ! filen download "$REMOTE_DEST" "$temp_download_dir"; then
+        # Attempt to restore previous backup directory if download fails
+        if [ -d "$backup_dir_backup" ]; then
+            log "Restoring previous backup directory" "WARN"
+            rm -rf "$BACKUP_DIR"
+            mv "$backup_dir_backup" "$BACKUP_DIR"
+        fi
+        handle_error "Failed to download repository from remote storage"
+    fi
+
+    # Move downloaded files to backup directory
+    log "Moving downloaded files to backup directory"
+    if ! cp -a "$temp_download_dir"/* "$BACKUP_DIR"/; then
+        handle_error "Failed to move downloaded files to backup directory"
+    fi
+
+    # Clean up temporary directory
+    rm -rf "$temp_download_dir"
+
+    # Verify the Borg repository
+    log "Verifying downloaded Borg repository"
+    if ! borg check "$BACKUP_DIR"; then
+        log "Warning: Downloaded repository verification failed" "WARN"
+        log "The repository may be incomplete or corrupted" "WARN"
+    else
+        log "Repository verification successful"
     fi
 
     log "Download completed successfully"
-    log "Archive $archive is now available in $BACKUP_DIR"
+    log "Backup repository is now available in $BACKUP_DIR"
+
+    # List available backups in the downloaded repository
+    log "Available backups in the downloaded repository:"
+    borg list "$BACKUP_DIR"
 
     finish 0
 }
@@ -707,8 +746,7 @@ while [[ $# -gt 0 ]]; do
         ;;
     --download)
         OPERATION="download"
-        ARCHIVE="$2"
-        shift 2
+        shift
         ;;
     -h | --help)
         print_usage
