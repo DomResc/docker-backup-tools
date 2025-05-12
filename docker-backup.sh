@@ -11,6 +11,11 @@ print_usage() {
     echo "  -c, --config FILE      Specify the configuration file (REQUIRED)"
     echo "  --create-config FILE   Create a sample configuration file"
     echo "  --show-config          Show active configuration and exit"
+    echo "  --backup               Perform a backup (default action when no other action specified)"
+    echo "  --restore ARCHIVE      Restore a specific backup archive"
+    echo "  --list                 List available backup archives"
+    echo "  --cleanup              Remove temporary files and enforce retention policy"
+    echo "  --download ARCHIVE     Download a backup archive from Filen remote storage"
     echo "  -h, --help             Show this help message"
     echo ""
     echo "To get started, create a configuration file with:"
@@ -67,6 +72,9 @@ EMAIL_SMTP_TLS=true
 INTERACTIVE=true
 SHOW_PROGRESS=true
 SYNC_ENABLED=true
+
+# Restore configuration
+RESTORE_TEMP_DIR="/tmp/docker-restore"
 EOF
     echo "Sample configuration generated at: $1"
     echo "Edit this file according to your needs and then run:"
@@ -110,82 +118,9 @@ print_config() {
     echo "Email: $EMAIL_ENABLED (to: $EMAIL_TO)"
     echo "Sync: $SYNC_ENABLED"
     echo "Mode: Interactive=$INTERACTIVE, Progress=$SHOW_PROGRESS"
+    echo
+    echo "Restore temporary directory: $RESTORE_TEMP_DIR"
 }
-
-# Parameter analysis
-CONFIG_FILE=""
-SHOW_CONFIG=false
-
-# If no parameters, show help and exit
-if [ $# -eq 0 ]; then
-    print_usage
-    exit 1
-fi
-
-# Parameter parsing
-while [[ $# -gt 0 ]]; do
-    case $1 in
-    -c | --config)
-        CONFIG_FILE="$2"
-        shift 2
-        ;;
-    --show-config)
-        SHOW_CONFIG=true
-        shift
-        ;;
-    --create-config)
-        if [ -z "$2" ]; then
-            echo "ERROR: Destination path not specified for --create-config"
-            exit 1
-        fi
-        create_sample_config "$2"
-        exit 0
-        shift 2
-        ;;
-    -h | --help)
-        print_usage
-        exit 0
-        ;;
-    *)
-        echo "Unknown parameter: $1"
-        print_usage
-        exit 1
-        ;;
-    esac
-done
-
-# Verify that the configuration file was specified
-if [ -z "$CONFIG_FILE" ]; then
-    echo "ERROR: Configuration file not specified."
-    print_usage
-    exit 1
-fi
-
-# Verify the configuration file
-verify_config "$CONFIG_FILE"
-
-# Load configuration file
-source "$CONFIG_FILE"
-
-# Show configuration if requested
-if [ "$SHOW_CONFIG" = true ]; then
-    print_config
-    exit 0
-fi
-
-# Verify that essential variables are set in the config
-if [ -z "$DOCKER_DIR" ] || [ -z "$BACKUP_DIR" ]; then
-    echo "ERROR: Incomplete configuration, missing essential parameters."
-    echo "Verify that DOCKER_DIR and BACKUP_DIR are set in the file $CONFIG_FILE"
-    exit 1
-fi
-
-echo "Configuration loaded from: $CONFIG_FILE"
-
-# Temporary file for email report
-EMAIL_TEMP_FILE=$(mktemp)
-BACKUP_SUCCESS=true
-BACKUP_START_TIME=$(date +%s)
 
 # Log function
 log() {
@@ -199,8 +134,10 @@ log() {
     # Log to file
     echo "$msg" >>"$LOG_FILE"
 
-    # Log to email temp file
-    echo "$msg" >>"$EMAIL_TEMP_FILE"
+    # Log to email temp file if it exists
+    if [ -f "$EMAIL_TEMP_FILE" ]; then
+        echo "$msg" >>"$EMAIL_TEMP_FILE"
+    fi
 
     # Log to screen if in interactive mode
     if [ "$INTERACTIVE" = true ] || [ "$level" = "ERROR" ]; then
@@ -311,11 +248,15 @@ finish() {
         send_email
     fi
 
-    # Remove temporary file
-    rm -f "$EMAIL_TEMP_FILE"
+    # Remove temporary file if exists
+    if [ -f "$EMAIL_TEMP_FILE" ]; then
+        rm -f "$EMAIL_TEMP_FILE"
+    fi
 
-    # Remove lock file
-    rm -f "$LOCK_FILE"
+    # Remove lock file if exists
+    if [ -f "$LOCK_FILE" ]; then
+        rm -f "$LOCK_FILE"
+    fi
 
     # Exit with appropriate code
     exit "$exit_code"
@@ -328,26 +269,484 @@ handle_error() {
     finish 1
 }
 
-# Trap signals for clean exit
-trap 'handle_error "Script interrupted by signal"' INT TERM
-
-# Create lock file to prevent multiple executions
-LOCK_FILE="/tmp/docker-backup.lock"
-if [ -e "$LOCK_FILE" ]; then
-    pid=$(cat "$LOCK_FILE")
-    if ps -p "$pid" >/dev/null; then
-        handle_error "Another instance of this script is already running (PID: $pid)"
-    else
-        log "Obsolete lock file detected, removing"
-        rm -f "$LOCK_FILE"
+# Function to stop Docker services
+stop_docker() {
+    log "Stopping Docker services"
+    if ! systemctl stop docker.socket; then
+        handle_error "Unable to stop docker.socket"
     fi
-fi
-echo $$ >"$LOCK_FILE"
 
-log "Starting Docker backup script"
-log "Configuration loaded from: $CONFIG_FILE"
-log "Configuration: DOCKER_DIR=$DOCKER_DIR, BACKUP_DIR=$BACKUP_DIR"
-log "Retention: daily=$KEEP_DAILY, weekly=$KEEP_WEEKLY, monthly=$KEEP_MONTHLY, yearly=$KEEP_YEARLY"
+    if ! systemctl stop docker.service; then
+        log "Unable to stop docker.service" "ERROR"
+        systemctl start docker.socket
+        handle_error "Unable to stop docker.service"
+    fi
+}
+
+# Function to start Docker services
+start_docker() {
+    log "Starting Docker services"
+    if ! systemctl start docker.service; then
+        handle_error "Unable to start docker.service"
+    fi
+
+    if ! systemctl start docker.socket; then
+        handle_error "Unable to start docker.socket"
+    fi
+}
+
+# Function to perform backup
+perform_backup() {
+    log "Starting Docker backup process"
+
+    # Create lock file to prevent multiple executions
+    LOCK_FILE="/tmp/docker-backup.lock"
+    if [ -e "$LOCK_FILE" ]; then
+        pid=$(cat "$LOCK_FILE")
+        if ps -p "$pid" >/dev/null; then
+            handle_error "Another instance of this script is already running (PID: $pid)"
+        else
+            log "Obsolete lock file detected, removing"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    echo $$ >"$LOCK_FILE"
+
+    # Temporary file for email report
+    EMAIL_TEMP_FILE=$(mktemp)
+    BACKUP_SUCCESS=true
+    BACKUP_START_TIME=$(date +%s)
+
+    log "Configuration loaded from: $CONFIG_FILE"
+    log "Configuration: DOCKER_DIR=$DOCKER_DIR, BACKUP_DIR=$BACKUP_DIR"
+    log "Retention: daily=$KEEP_DAILY, weekly=$KEEP_WEEKLY, monthly=$KEEP_MONTHLY, yearly=$KEEP_YEARLY"
+
+    # Check if Docker directory exists
+    if [ ! -d "$DOCKER_DIR" ]; then
+        handle_error "Docker directory $DOCKER_DIR does not exist"
+    fi
+
+    # Check available space
+    AVAILABLE_SPACE=$(df -Pk "$BACKUP_DIR" | tail -1 | awk '{print $4}')
+    DOCKER_SIZE=$(du -sk "$DOCKER_DIR" | awk '{print $1}')
+    if [ "$AVAILABLE_SPACE" -lt "$DOCKER_SIZE" ]; then
+        handle_error "Insufficient space for backup. Available: ${AVAILABLE_SPACE}KB, Required: ${DOCKER_SIZE}KB"
+    fi
+
+    # Set borg options based on mode
+    BORG_OPTS=""
+    if [ "$SHOW_PROGRESS" = true ]; then
+        BORG_OPTS="--progress"
+    fi
+    if [ "$INTERACTIVE" = false ]; then
+        export BORG_RELOCATED_REPO_ACCESS_IS_OK=yes
+        export BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes
+    fi
+
+    # Initialize Borg repo if it doesn't exist
+    if [ ! -d "$BACKUP_DIR/data" ]; then
+        log "Initializing Borg repository"
+        if ! borg init --encryption=none "$BACKUP_DIR"; then
+            handle_error "Unable to initialize Borg repository"
+        fi
+    fi
+
+    # Stop Docker services
+    stop_docker
+    show_progress 10
+
+    # Backup name with timestamp
+    BACKUP_NAME="docker-$(date +%Y-%m-%d_%H:%M:%S)"
+
+    # Create backup
+    log "Creating backup: $BACKUP_NAME"
+    if ! borg create --stats $BORG_OPTS --compression "$COMPRESSION" "$BACKUP_DIR"::"$BACKUP_NAME" "$DOCKER_DIR"; then
+        log "Backup creation failed" "ERROR"
+        start_docker
+        handle_error "Backup creation failed"
+    fi
+    show_progress 40
+
+    # Restart Docker services
+    start_docker
+    show_progress 50
+
+    # Verify backup integrity
+    log "Verifying backup integrity"
+    if ! borg check $BORG_OPTS "$BACKUP_DIR"::"$BACKUP_NAME"; then
+        handle_error "Backup integrity verification failed"
+    fi
+    show_progress 60
+
+    # Clean old backups with advanced strategy
+    log "Cleaning old backups"
+    if ! borg prune --stats $BORG_OPTS \
+        --keep-daily="$KEEP_DAILY" \
+        --keep-weekly="$KEEP_WEEKLY" \
+        --keep-monthly="$KEEP_MONTHLY" \
+        --keep-yearly="$KEEP_YEARLY" \
+        "$BACKUP_DIR"; then
+        handle_error "Backup cleanup failed"
+    fi
+    show_progress 75
+
+    # Compact repository
+    log "Compacting repository"
+    if ! borg compact $BORG_OPTS "$BACKUP_DIR"; then
+        handle_error "Repository compaction failed"
+    fi
+    show_progress 85
+
+    # Sync backup
+    if [ "$SYNC_ENABLED" = true ]; then
+        log "Syncing backup to remote storage: $REMOTE_DEST"
+        if ! filen sync "$BACKUP_DIR":ltc:"$REMOTE_DEST"; then
+            handle_error "Remote storage sync failed"
+        fi
+    else
+        log "Remote sync disabled"
+    fi
+    show_progress 100
+
+    # Line break after progress bar
+    if [ "$SHOW_PROGRESS" = true ] && [ "$INTERACTIVE" = true ]; then
+        echo
+    fi
+
+    log "Backup completed successfully"
+    finish 0
+}
+
+# Function to list available backups
+list_backups() {
+    log "Listing available backups"
+
+    # Check if backup directory exists
+    if [ ! -d "$BACKUP_DIR" ]; then
+        handle_error "Backup directory $BACKUP_DIR does not exist"
+    fi
+
+    echo "=== Local Backups ==="
+    borg list "$BACKUP_DIR"
+
+    # Check if Filen is enabled and available
+    if [ "$SYNC_ENABLED" = true ] && command -v filen &>/dev/null; then
+        echo ""
+        echo "=== Remote Backups (Filen) ==="
+        filen ls "$REMOTE_DEST"
+    fi
+}
+
+# Function to restore backup
+restore_backup() {
+    local archive="$1"
+
+    if [ -z "$archive" ]; then
+        handle_error "No archive specified for restore"
+    fi
+
+    log "Starting Docker backup restore for archive: $archive"
+
+    # Create lock file to prevent multiple executions
+    LOCK_FILE="/tmp/docker-backup.lock"
+    if [ -e "$LOCK_FILE" ]; then
+        pid=$(cat "$LOCK_FILE")
+        if ps -p "$pid" >/dev/null; then
+            handle_error "Another instance of this script is already running (PID: $pid)"
+        else
+            log "Obsolete lock file detected, removing"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    echo $$ >"$LOCK_FILE"
+
+    # Temporary file for email report
+    EMAIL_TEMP_FILE=$(mktemp)
+    BACKUP_SUCCESS=true
+    BACKUP_START_TIME=$(date +%s)
+
+    # Verify the archive exists
+    if ! borg list "$BACKUP_DIR"::"$archive" &>/dev/null; then
+        handle_error "Archive $archive not found in repository"
+    fi
+
+    # Create temporary restore directory if it doesn't exist
+    if [ ! -d "$RESTORE_TEMP_DIR" ]; then
+        log "Creating temporary restore directory: $RESTORE_TEMP_DIR"
+        if ! mkdir -p "$RESTORE_TEMP_DIR"; then
+            handle_error "Unable to create temporary restore directory"
+        fi
+    else
+        # Clean any previous restore data
+        log "Cleaning temporary restore directory"
+        if ! rm -rf "$RESTORE_TEMP_DIR"/*; then
+            handle_error "Unable to clean temporary restore directory"
+        fi
+    fi
+
+    show_progress 10
+
+    # Extract backup to temporary location
+    log "Extracting backup to temporary location"
+    if ! borg extract --progress "$BACKUP_DIR"::"$archive" --destination "$RESTORE_TEMP_DIR"; then
+        handle_error "Failed to extract backup"
+    fi
+
+    show_progress 50
+
+    # Stop Docker services
+    stop_docker
+
+    show_progress 60
+
+    # Move current Docker directory to backup (just in case)
+    local date_suffix=$(date +%Y%m%d%H%M%S)
+    local docker_backup="$DOCKER_DIR.backup.$date_suffix"
+    log "Moving current Docker directory to $docker_backup"
+    if ! mv "$DOCKER_DIR" "$docker_backup"; then
+        start_docker
+        handle_error "Failed to backup current Docker directory"
+    fi
+
+    show_progress 70
+
+    # Create new Docker directory
+    if ! mkdir -p "$DOCKER_DIR"; then
+        log "Failed to create new Docker directory, restoring from backup" "ERROR"
+        mv "$docker_backup" "$DOCKER_DIR"
+        start_docker
+        handle_error "Failed to create new Docker directory"
+    fi
+
+    # Copy restored data to Docker directory
+    log "Copying restored data to Docker directory"
+    if ! cp -a "$RESTORE_TEMP_DIR"/* "$DOCKER_DIR"/; then
+        log "Failed to copy restored data, restoring from backup" "ERROR"
+        rm -rf "$DOCKER_DIR"
+        mv "$docker_backup" "$DOCKER_DIR"
+        start_docker
+        handle_error "Failed to copy restored data"
+    fi
+
+    show_progress 90
+
+    # Set proper permissions
+    log "Setting proper permissions"
+    chown -R root:root "$DOCKER_DIR"
+
+    # Start Docker services
+    start_docker
+
+    show_progress 100
+
+    # Line break after progress bar
+    if [ "$SHOW_PROGRESS" = true ] && [ "$INTERACTIVE" = true ]; then
+        echo
+    fi
+
+    log "Restore completed successfully"
+    log "Previous Docker directory backed up at: $docker_backup"
+    log "You may want to remove it after verifying everything works correctly"
+
+    finish 0
+}
+
+# Function to cleanup temporary files and enforce retention
+cleanup() {
+    log "Starting cleanup process"
+
+    # Check if backup directory exists
+    if [ ! -d "$BACKUP_DIR" ]; then
+        handle_error "Backup directory $BACKUP_DIR does not exist"
+    fi
+
+    # Remove temporary directories if they exist
+    if [ -d "$RESTORE_TEMP_DIR" ]; then
+        log "Cleaning temporary restore directory"
+        if ! rm -rf "$RESTORE_TEMP_DIR"/*; then
+            handle_error "Unable to clean temporary restore directory"
+        fi
+    fi
+
+    # Enforce retention policy
+    log "Enforcing retention policy"
+    if ! borg prune --stats \
+        --keep-daily="$KEEP_DAILY" \
+        --keep-weekly="$KEEP_WEEKLY" \
+        --keep-monthly="$KEEP_MONTHLY" \
+        --keep-yearly="$KEEP_YEARLY" \
+        "$BACKUP_DIR"; then
+        handle_error "Retention policy enforcement failed"
+    fi
+
+    # Compact repository
+    log "Compacting repository to reclaim space"
+    if ! borg compact "$BACKUP_DIR"; then
+        handle_error "Repository compaction failed"
+    fi
+
+    # Remove lock files if they exist and no backup is running
+    if [ -f "/tmp/docker-backup.lock" ]; then
+        pid=$(cat "/tmp/docker-backup.lock")
+        if ! ps -p "$pid" >/dev/null; then
+            log "Removing stale lock file"
+            rm -f "/tmp/docker-backup.lock"
+        fi
+    fi
+
+    log "Cleanup completed successfully"
+}
+
+# Function to download backup from Filen
+download_backup() {
+    local archive="$1"
+
+    if [ -z "$archive" ]; then
+        handle_error "No archive specified for download"
+    fi
+
+    log "Starting download of backup archive: $archive from Filen"
+
+    # Check if Filen is available
+    if ! command -v filen &>/dev/null; then
+        handle_error "Filen client not installed. Please install it to download backups."
+    fi
+
+    # Check if backup directory exists locally
+    if [ ! -d "$BACKUP_DIR" ]; then
+        log "Creating local backup directory"
+        if ! mkdir -p "$BACKUP_DIR"; then
+            handle_error "Unable to create local backup directory"
+        fi
+    fi
+
+    # Create lock file to prevent multiple executions
+    LOCK_FILE="/tmp/docker-backup.lock"
+    if [ -e "$LOCK_FILE" ]; then
+        pid=$(cat "$LOCK_FILE")
+        if ps -p "$pid" >/dev/null; then
+            handle_error "Another instance of this script is already running (PID: $pid)"
+        else
+            log "Obsolete lock file detected, removing"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    echo $$ >"$LOCK_FILE"
+
+    # Temporary file for email report
+    EMAIL_TEMP_FILE=$(mktemp)
+    BACKUP_SUCCESS=true
+    BACKUP_START_TIME=$(date +%s)
+
+    # Check if the archive exists in remote storage
+    log "Verifying archive exists in remote storage"
+    if ! filen ls "$REMOTE_DEST/$archive" &>/dev/null; then
+        handle_error "Archive $archive not found in remote storage"
+    fi
+
+    # Download the backup
+    log "Downloading archive from remote storage"
+    if ! filen download "$REMOTE_DEST/$archive" "$BACKUP_DIR"; then
+        handle_error "Failed to download archive from remote storage"
+    fi
+
+    log "Download completed successfully"
+    log "Archive $archive is now available in $BACKUP_DIR"
+
+    finish 0
+}
+
+# Parameter analysis
+CONFIG_FILE=""
+SHOW_CONFIG=false
+OPERATION="backup"
+ARCHIVE=""
+
+# If no parameters, show help and exit
+if [ $# -eq 0 ]; then
+    print_usage
+    exit 1
+fi
+
+# Parameter parsing
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    -c | --config)
+        CONFIG_FILE="$2"
+        shift 2
+        ;;
+    --show-config)
+        SHOW_CONFIG=true
+        shift
+        ;;
+    --create-config)
+        if [ -z "$2" ]; then
+            echo "ERROR: Destination path not specified for --create-config"
+            exit 1
+        fi
+        create_sample_config "$2"
+        exit 0
+        shift 2
+        ;;
+    --backup)
+        OPERATION="backup"
+        shift
+        ;;
+    --restore)
+        OPERATION="restore"
+        ARCHIVE="$2"
+        shift 2
+        ;;
+    --list)
+        OPERATION="list"
+        shift
+        ;;
+    --cleanup)
+        OPERATION="cleanup"
+        shift
+        ;;
+    --download)
+        OPERATION="download"
+        ARCHIVE="$2"
+        shift 2
+        ;;
+    -h | --help)
+        print_usage
+        exit 0
+        ;;
+    *)
+        echo "Unknown parameter: $1"
+        print_usage
+        exit 1
+        ;;
+    esac
+done
+
+# Verify that the configuration file was specified
+if [ -z "$CONFIG_FILE" ]; then
+    echo "ERROR: Configuration file not specified."
+    print_usage
+    exit 1
+fi
+
+# Verify the configuration file
+verify_config "$CONFIG_FILE"
+
+# Load configuration file
+source "$CONFIG_FILE"
+
+# Show configuration if requested
+if [ "$SHOW_CONFIG" = true ]; then
+    print_config
+    exit 0
+fi
+
+# Verify that essential variables are set in the config
+if [ -z "$DOCKER_DIR" ] || [ -z "$BACKUP_DIR" ]; then
+    echo "ERROR: Incomplete configuration, missing essential parameters."
+    echo "Verify that DOCKER_DIR and BACKUP_DIR are set in the file $CONFIG_FILE"
+    exit 1
+fi
 
 # Check if script is run as root
 if [ "$(id -u)" -ne 0 ]; then
@@ -379,108 +778,30 @@ if [ ! -d "$BACKUP_DIR" ]; then
     fi
 fi
 
-# Check if Docker directory exists
-if [ ! -d "$DOCKER_DIR" ]; then
-    handle_error "Docker directory $DOCKER_DIR does not exist"
-fi
+# Trap signals for clean exit
+trap 'handle_error "Script interrupted by signal"' INT TERM
 
-# Check available space
-AVAILABLE_SPACE=$(df -Pk "$BACKUP_DIR" | tail -1 | awk '{print $4}')
-DOCKER_SIZE=$(du -sk "$DOCKER_DIR" | awk '{print $1}')
-if [ "$AVAILABLE_SPACE" -lt "$DOCKER_SIZE" ]; then
-    handle_error "Insufficient space for backup. Available: ${AVAILABLE_SPACE}KB, Required: ${DOCKER_SIZE}KB"
-fi
-
-# Set borg options based on mode
-BORG_OPTS=""
-if [ "$SHOW_PROGRESS" = true ]; then
-    BORG_OPTS="--progress"
-fi
-if [ "$INTERACTIVE" = false ]; then
-    export BORG_RELOCATED_REPO_ACCESS_IS_OK=yes
-    export BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes
-fi
-
-# Stop Docker services
-log "Stopping Docker services"
-if ! systemctl stop docker.socket; then
-    handle_error "Unable to stop docker.socket"
-fi
-
-if ! systemctl stop docker.service; then
-    log "Unable to stop docker.service" "ERROR"
-    systemctl start docker.socket
-    handle_error "Unable to stop docker.service"
-fi
-
-# Backup name with timestamp
-BACKUP_NAME="docker-$(date +%Y-%m-%d_%H:%M:%S)"
-show_progress 10
-
-# Create backup
-log "Creating backup: $BACKUP_NAME"
-if ! borg create --stats $BORG_OPTS --compression "$COMPRESSION" "$BACKUP_DIR"::"$BACKUP_NAME" "$DOCKER_DIR"; then
-    log "Backup creation failed" "ERROR"
-    systemctl start docker.service
-    systemctl start docker.socket
-    handle_error "Backup creation failed"
-fi
-show_progress 40
-
-# Restart Docker services
-log "Restarting Docker services"
-if ! systemctl start docker.service; then
-    handle_error "Unable to restart docker.service"
-fi
-
-if ! systemctl start docker.socket; then
-    handle_error "Unable to restart docker.socket"
-fi
-show_progress 50
-
-# Verify backup integrity
-log "Verifying backup integrity"
-if ! borg check $BORG_OPTS "$BACKUP_DIR"; then
-    handle_error "Backup integrity verification failed"
-fi
-show_progress 60
-
-# Clean old backups with advanced strategy
-log "Cleaning old backups"
-if ! borg prune --stats $BORG_OPTS \
-    --keep-daily="$KEEP_DAILY" \
-    --keep-weekly="$KEEP_WEEKLY" \
-    --keep-monthly="$KEEP_MONTHLY" \
-    --keep-yearly="$KEEP_YEARLY" \
-    "$BACKUP_DIR"; then
-    handle_error "Backup cleanup failed"
-fi
-show_progress 75
-
-# Compact repository
-log "Compacting repository"
-if ! borg compact $BORG_OPTS "$BACKUP_DIR"; then
-    handle_error "Repository compaction failed"
-fi
-show_progress 85
-
-# Sync backup
-if [ "$SYNC_ENABLED" = true ]; then
-    log "Syncing backup to remote storage: $REMOTE_DEST"
-    if ! filen sync "$BACKUP_DIR":ltc:"$REMOTE_DEST"; then
-        handle_error "Remote storage sync failed"
-    fi
-else
-    log "Remote sync disabled"
-fi
-show_progress 100
-
-# Line break after progress bar
-if [ "$SHOW_PROGRESS" = true ] && [ "$INTERACTIVE" = true ]; then
-    echo
-fi
-
-log "Backup completed successfully"
+# Execute the requested operation
+case "$OPERATION" in
+backup)
+    perform_backup
+    ;;
+restore)
+    restore_backup "$ARCHIVE"
+    ;;
+list)
+    list_backups
+    ;;
+cleanup)
+    cleanup
+    ;;
+download)
+    download_backup "$ARCHIVE"
+    ;;
+*)
+    handle_error "Unknown operation: $OPERATION"
+    ;;
+esac
 
 # End
 finish 0
