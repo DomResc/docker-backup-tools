@@ -73,6 +73,12 @@ INTERACTIVE=true
 SHOW_PROGRESS=true
 SYNC_ENABLED=true
 
+# Docker cleanup configuration
+DOCKER_CLEANUP_ENABLED=false
+DOCKER_PRUNE_ALL_IMAGES=false
+DOCKER_SYSTEM_PRUNE=false
+DOCKER_PRUNE_VOLUMES=false
+
 # Restore configuration
 RESTORE_TEMP_DIR="/tmp/docker-restore"
 EOF
@@ -118,6 +124,13 @@ print_config() {
     echo "Email: $EMAIL_ENABLED (to: $EMAIL_TO)"
     echo "Sync: $SYNC_ENABLED"
     echo "Mode: Interactive=$INTERACTIVE, Progress=$SHOW_PROGRESS"
+    echo
+    echo "Docker Cleanup: $DOCKER_CLEANUP_ENABLED"
+    if [ "$DOCKER_CLEANUP_ENABLED" = true ]; then
+        echo "  Prune All Images: $DOCKER_PRUNE_ALL_IMAGES"
+        echo "  System Prune: $DOCKER_SYSTEM_PRUNE"
+        echo "  Prune Volumes: $DOCKER_PRUNE_VOLUMES"
+    fi
     echo
     echo "Restore temporary directory: $RESTORE_TEMP_DIR"
 }
@@ -578,12 +591,96 @@ cleanup() {
         handle_error "Backup directory $BACKUP_DIR does not exist"
     fi
 
+    # Set default values for new configuration parameters if not set
+    DOCKER_CLEANUP_ENABLED=${DOCKER_CLEANUP_ENABLED:-false}
+    DOCKER_PRUNE_ALL_IMAGES=${DOCKER_PRUNE_ALL_IMAGES:-false}
+    DOCKER_SYSTEM_PRUNE=${DOCKER_SYSTEM_PRUNE:-false}
+    DOCKER_PRUNE_VOLUMES=${DOCKER_PRUNE_VOLUMES:-false}
+
     # Remove temporary directories if they exist
     if [ -d "$RESTORE_TEMP_DIR" ]; then
         log "Cleaning temporary restore directory"
         if ! rm -rf "$RESTORE_TEMP_DIR"/*; then
             handle_error "Unable to clean temporary restore directory"
         fi
+    fi
+
+    # Perform Docker cleanup if enabled
+    if [ "$DOCKER_CLEANUP_ENABLED" = true ]; then
+        log "Docker cleanup is enabled"
+
+        # Check if Docker is running
+        if ! systemctl is-active --quiet docker; then
+            log "Starting Docker services for cleanup"
+            if ! systemctl start docker; then
+                handle_error "Unable to start Docker for cleanup"
+            fi
+        fi
+
+        # Perform Docker cleanup
+        log "Starting Docker cleanup operations"
+
+        # Remove stopped containers
+        log "Removing stopped containers"
+        if ! docker container prune -f; then
+            log "Warning: Failed to remove stopped containers" "WARN"
+        fi
+
+        # Remove unused images (with option for all unused vs just dangling)
+        if [ "$DOCKER_PRUNE_ALL_IMAGES" = true ]; then
+            log "Removing ALL unused Docker images (including tagged images)"
+            if ! docker image prune -af; then
+                log "Warning: Failed to remove unused images" "WARN"
+            fi
+        else
+            log "Removing dangling Docker images only"
+            if ! docker image prune -f; then
+                log "Warning: Failed to remove dangling images" "WARN"
+            fi
+        fi
+
+        # Remove unused volumes if configured
+        if [ "$DOCKER_PRUNE_VOLUMES" = true ]; then
+            log "Removing unused Docker volumes"
+            if ! docker volume prune -f; then
+                log "Warning: Failed to remove unused volumes" "WARN"
+            fi
+        fi
+
+        # Remove unused networks
+        log "Removing unused Docker networks"
+        if ! docker network prune -f; then
+            log "Warning: Failed to remove unused networks" "WARN"
+        fi
+
+        # System prune (more aggressive cleanup, optional)
+        if [ "$DOCKER_SYSTEM_PRUNE" = true ]; then
+            if [ "$DOCKER_PRUNE_ALL_IMAGES" = true ] && [ "$DOCKER_PRUNE_VOLUMES" = true ]; then
+                log "Performing system-wide Docker cleanup (including ALL images and volumes)"
+                if ! docker system prune -af --volumes; then
+                    log "Warning: Failed to perform system prune with all images and volumes" "WARN"
+                fi
+            elif [ "$DOCKER_PRUNE_ALL_IMAGES" = true ]; then
+                log "Performing system-wide Docker cleanup (including ALL images)"
+                if ! docker system prune -af; then
+                    log "Warning: Failed to perform system prune with all images" "WARN"
+                fi
+            elif [ "$DOCKER_PRUNE_VOLUMES" = true ]; then
+                log "Performing system-wide Docker cleanup (with volumes)"
+                if ! docker system prune -f --volumes; then
+                    log "Warning: Failed to perform system prune with volumes" "WARN"
+                fi
+            else
+                log "Performing basic system-wide Docker cleanup (dangling only)"
+                if ! docker system prune -f; then
+                    log "Warning: Failed to perform basic system prune" "WARN"
+                fi
+            fi
+        fi
+
+        log "Docker cleanup completed"
+    else
+        log "Docker cleanup is disabled in configuration"
     fi
 
     # Enforce retention policy
