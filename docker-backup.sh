@@ -1,13 +1,50 @@
 #!/bin/bash
 
-# Configuration (modify these values as needed)
+# Function to print usage
+print_usage() {
+    echo "ERROR: Configuration file not specified."
+    echo ""
+    echo "USAGE:"
+    echo "  $0 -c /path/to/configuration.conf [options]"
+    echo ""
+    echo "OPTIONS:"
+    echo "  -c, --config FILE      Specify the configuration file (REQUIRED)"
+    echo "  --create-config FILE   Create a sample configuration file"
+    echo "  --show-config          Show active configuration and exit"
+    echo "  -h, --help             Show this help message"
+    echo ""
+    echo "To get started, create a configuration file with:"
+    echo "  $0 --create-config /path/to/save/configuration.conf"
+    echo ""
+}
+
+# Function to create a sample configuration file
+create_sample_config() {
+    # Verify that the destination directory exists
+    CONFIG_DIR=$(dirname "$1")
+    if [ ! -d "$CONFIG_DIR" ]; then
+        mkdir -p "$CONFIG_DIR" || {
+            echo "Unable to create directory $CONFIG_DIR"
+            exit 1
+        }
+    fi
+
+    cat >"$1" <<EOF
+# Docker Backup Configuration
+# Generated: $(date)
+# --------------------------------------------------------------
+# WARNING: This file contains critical settings!
+# Modify with care and test after making changes.
+# --------------------------------------------------------------
+
+# Main directories
 DOCKER_DIR="/var/lib/docker"
 BACKUP_DIR="/backup/docker"
 REMOTE_DEST="/backup/docker"
 LOG_FILE="/var/log/docker-backup.log"
 COMPRESSION="lz4"
 
-# Retention configuration
+# Retention policy
 KEEP_DAILY=7
 KEEP_WEEKLY=4
 KEEP_MONTHLY=12
@@ -30,6 +67,120 @@ EMAIL_SMTP_TLS=true
 INTERACTIVE=true
 SHOW_PROGRESS=true
 SYNC_ENABLED=true
+EOF
+    echo "Sample configuration generated at: $1"
+    echo "Edit this file according to your needs and then run:"
+    echo "  $0 -c $1"
+
+    # Set secure permissions
+    chmod 600 "$1"
+}
+
+# Function to verify the configuration file
+verify_config() {
+    if [ ! -f "$1" ]; then
+        echo "ERROR: Configuration file '$1' does not exist."
+        echo "Create a configuration file with:"
+        echo "  $0 --create-config $1"
+        exit 1
+    fi
+
+    if [ ! -r "$1" ]; then
+        echo "ERROR: Configuration file '$1' is not readable."
+        echo "Check file permissions."
+        exit 1
+    fi
+}
+
+# Function to print active configuration
+print_config() {
+    echo "=== Active Configuration ==="
+    echo "DOCKER_DIR: $DOCKER_DIR"
+    echo "BACKUP_DIR: $BACKUP_DIR"
+    echo "REMOTE_DEST: $REMOTE_DEST"
+    echo "LOG_FILE: $LOG_FILE"
+    echo "COMPRESSION: $COMPRESSION"
+    echo
+    echo "Retention:"
+    echo "  KEEP_DAILY: $KEEP_DAILY"
+    echo "  KEEP_WEEKLY: $KEEP_WEEKLY"
+    echo "  KEEP_MONTHLY: $KEEP_MONTHLY"
+    echo "  KEEP_YEARLY: $KEEP_YEARLY"
+    echo
+    echo "Email: $EMAIL_ENABLED (to: $EMAIL_TO)"
+    echo "Sync: $SYNC_ENABLED"
+    echo "Mode: Interactive=$INTERACTIVE, Progress=$SHOW_PROGRESS"
+}
+
+# Parameter analysis
+CONFIG_FILE=""
+SHOW_CONFIG=false
+
+# If no parameters, show help and exit
+if [ $# -eq 0 ]; then
+    print_usage
+    exit 1
+fi
+
+# Parameter parsing
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    -c | --config)
+        CONFIG_FILE="$2"
+        shift 2
+        ;;
+    --show-config)
+        SHOW_CONFIG=true
+        shift
+        ;;
+    --create-config)
+        if [ -z "$2" ]; then
+            echo "ERROR: Destination path not specified for --create-config"
+            exit 1
+        fi
+        create_sample_config "$2"
+        exit 0
+        shift 2
+        ;;
+    -h | --help)
+        print_usage
+        exit 0
+        ;;
+    *)
+        echo "Unknown parameter: $1"
+        print_usage
+        exit 1
+        ;;
+    esac
+done
+
+# Verify that the configuration file was specified
+if [ -z "$CONFIG_FILE" ]; then
+    echo "ERROR: Configuration file not specified."
+    print_usage
+    exit 1
+fi
+
+# Verify the configuration file
+verify_config "$CONFIG_FILE"
+
+# Load configuration file
+source "$CONFIG_FILE"
+
+# Show configuration if requested
+if [ "$SHOW_CONFIG" = true ]; then
+    print_config
+    exit 0
+fi
+
+# Verify that essential variables are set in the config
+if [ -z "$DOCKER_DIR" ] || [ -z "$BACKUP_DIR" ]; then
+    echo "ERROR: Incomplete configuration, missing essential parameters."
+    echo "Verify that DOCKER_DIR and BACKUP_DIR are set in the file $CONFIG_FILE"
+    exit 1
+fi
+
+echo "Configuration loaded from: $CONFIG_FILE"
 
 # Temporary file for email report
 EMAIL_TEMP_FILE=$(mktemp)
@@ -163,6 +314,9 @@ finish() {
     # Remove temporary file
     rm -f "$EMAIL_TEMP_FILE"
 
+    # Remove lock file
+    rm -f "$LOCK_FILE"
+
     # Exit with appropriate code
     exit "$exit_code"
 }
@@ -173,6 +327,9 @@ handle_error() {
     BACKUP_SUCCESS=false
     finish 1
 }
+
+# Trap signals for clean exit
+trap 'handle_error "Script interrupted by signal"' INT TERM
 
 # Create lock file to prevent multiple executions
 LOCK_FILE="/tmp/docker-backup.lock"
@@ -188,6 +345,7 @@ fi
 echo $$ >"$LOCK_FILE"
 
 log "Starting Docker backup script"
+log "Configuration loaded from: $CONFIG_FILE"
 log "Configuration: DOCKER_DIR=$DOCKER_DIR, BACKUP_DIR=$BACKUP_DIR"
 log "Retention: daily=$KEEP_DAILY, weekly=$KEEP_WEEKLY, monthly=$KEEP_MONTHLY, yearly=$KEEP_YEARLY"
 
@@ -323,9 +481,6 @@ if [ "$SHOW_PROGRESS" = true ] && [ "$INTERACTIVE" = true ]; then
 fi
 
 log "Backup completed successfully"
-
-# Remove lock file
-rm -f "$LOCK_FILE"
 
 # End
 finish 0

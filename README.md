@@ -13,6 +13,7 @@ A robust Bash script for backing up Docker data directories using Borg backup wi
 - **Error Handling**: Comprehensive error handling with automatic service recovery
 - **Resource Verification**: Checks for sufficient disk space before starting
 - **Lock Mechanism**: Prevents concurrent execution of multiple backup instances
+- **Required Configuration File**: Ensures explicit configuration for safer operation
 
 ## Requirements
 
@@ -25,7 +26,13 @@ A robust Bash script for backing up Docker data directories using Borg backup wi
 
 ## Configuration
 
-Edit the script and modify the following variables at the beginning:
+The script requires a configuration file to run. You can create a sample configuration file with:
+
+```bash
+sudo ./docker-backup.sh --create-config /etc/docker-backup/config.conf
+```
+
+Then edit this file to customize the settings:
 
 ### Basic Configuration
 
@@ -72,10 +79,40 @@ SYNC_ENABLED=true     # Enable remote synchronization
 
 ## Usage
 
-Run the script as root:
+The script must be run with a configuration file:
 
 ```bash
-sudo ./docker-backup.sh
+sudo ./docker-backup.sh -c /path/to/config.conf
+```
+
+### Available Options
+
+```
+OPTIONS:
+  -c, --config FILE      Specify the configuration file (REQUIRED)
+  --create-config FILE   Create a sample configuration file
+  --show-config          Show active configuration and exit
+  -h, --help             Show this help message
+```
+
+### Examples
+
+Create a configuration file:
+
+```bash
+sudo ./docker-backup.sh --create-config /etc/docker-backup/config.conf
+```
+
+View current configuration:
+
+```bash
+sudo ./docker-backup.sh -c /etc/docker-backup/config.conf --show-config
+```
+
+Run the backup:
+
+```bash
+sudo ./docker-backup.sh -c /etc/docker-backup/config.conf
 ```
 
 ## Scheduling with Cron
@@ -90,10 +127,10 @@ Then add a line like:
 
 ```
 # Run Docker backup every day at 2 AM
-0 2 * * * /path/to/docker-backup.sh
+0 2 * * * /path/to/docker-backup.sh -c /etc/docker-backup/config.conf
 ```
 
-When running via cron, you might want to set `INTERACTIVE=false` and `SHOW_PROGRESS=false` in the script configuration.
+When running via cron, you might want to set `INTERACTIVE=false` and `SHOW_PROGRESS=false` in the configuration file.
 
 ## Troubleshooting
 
@@ -101,6 +138,7 @@ Check the log file (default: `/var/log/docker-backup.log`) for detailed informat
 
 Common issues:
 
+- **Configuration file not found**: Make sure the path to the configuration file is correct
 - **Insufficient disk space**: Ensure the backup destination has enough free space
 - **Tool not found**: Install missing tools (borg, filen, msmtp)
 - **Docker not stopping**: Check Docker service status and dependencies
@@ -109,5 +147,6 @@ Common issues:
 ## Security Notes
 
 - The script requires root privileges to stop and start Docker services
-- SMTP passwords in the script could be a security risk; consider using environment variables or secure credential storage
+- The configuration file permissions are set to 600 (readable only by owner) by default
+- SMTP passwords in the configuration file could be a security risk; consider using environment variables or secure credential storage
 - Ensure your backup directory has appropriate permissions
