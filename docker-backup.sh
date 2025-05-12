@@ -15,7 +15,7 @@ print_usage() {
     echo "  --restore ARCHIVE      Restore a specific backup archive"
     echo "  --list                 List available backup archives"
     echo "  --cleanup              Remove temporary files and enforce retention policy"
-    echo "  --download ARCHIVE     Download a backup archive from Filen remote storage"
+    echo "  --download             Download backup repository from Filen remote storage"
     echo "  -h, --help             Show this help message"
     echo ""
     echo "To get started, create a configuration file with:"
@@ -122,6 +122,38 @@ print_config() {
     echo "Restore temporary directory: $RESTORE_TEMP_DIR"
 }
 
+# Create lock directory function - more atomic than file-based locks
+create_lock() {
+    LOCK_DIR="/tmp/docker-backup.lock"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        # Check if the lock is stale
+        if [ -f "$LOCK_DIR/pid" ]; then
+            pid=$(cat "$LOCK_DIR/pid")
+            if ! ps -p "$pid" >/dev/null 2>&1; then
+                log "Removing stale lock from PID $pid" "WARN"
+                rm -rf "$LOCK_DIR"
+                mkdir "$LOCK_DIR" || return 1
+            else
+                return 1 # Lock exists and process is still running
+            fi
+        else
+            return 1 # Lock exists but no PID file (shouldn't happen)
+        fi
+    fi
+
+    # Store PID in the lock directory
+    echo $$ >"$LOCK_DIR/pid"
+    return 0
+}
+
+# Remove lock directory function
+remove_lock() {
+    LOCK_DIR="/tmp/docker-backup.lock"
+    if [ -d "$LOCK_DIR" ]; then
+        rm -rf "$LOCK_DIR"
+    fi
+}
+
 # Log function
 log() {
     local level="INFO"
@@ -203,6 +235,8 @@ send_email() {
             fi
         } >"$msmtp_config"
 
+        chmod 600 "$msmtp_config" # Ensure config file has secure permissions
+
         # Send email using config file
         if cat "$email_body_file" | msmtp --file="$msmtp_config" "$EMAIL_TO"; then
             log "Notification email sent to $EMAIL_TO"
@@ -253,10 +287,8 @@ finish() {
         rm -f "$EMAIL_TEMP_FILE"
     fi
 
-    # Remove lock file if exists
-    if [ -f "$LOCK_FILE" ]; then
-        rm -f "$LOCK_FILE"
-    fi
+    # Remove lock
+    remove_lock
 
     # Exit with appropriate code
     exit "$exit_code"
@@ -299,18 +331,11 @@ start_docker() {
 perform_backup() {
     log "Starting Docker backup process"
 
-    # Create lock file to prevent multiple executions
-    LOCK_FILE="/tmp/docker-backup.lock"
-    if [ -e "$LOCK_FILE" ]; then
-        pid=$(cat "$LOCK_FILE")
-        if ps -p "$pid" >/dev/null; then
-            handle_error "Another instance of this script is already running (PID: $pid)"
-        else
-            log "Obsolete lock file detected, removing"
-            rm -f "$LOCK_FILE"
-        fi
+    # Create lock to prevent multiple executions
+    if ! create_lock; then
+        pid=$(cat "/tmp/docker-backup.lock/pid" 2>/dev/null || echo "unknown")
+        handle_error "Another instance of this script is already running (PID: $pid)"
     fi
-    echo $$ >"$LOCK_FILE"
 
     # Temporary file for email report
     EMAIL_TEMP_FILE=$(mktemp)
@@ -447,18 +472,11 @@ restore_backup() {
 
     log "Starting Docker backup restore for archive: $archive"
 
-    # Create lock file to prevent multiple executions
-    LOCK_FILE="/tmp/docker-backup.lock"
-    if [ -e "$LOCK_FILE" ]; then
-        pid=$(cat "$LOCK_FILE")
-        if ps -p "$pid" >/dev/null; then
-            handle_error "Another instance of this script is already running (PID: $pid)"
-        else
-            log "Obsolete lock file detected, removing"
-            rm -f "$LOCK_FILE"
-        fi
+    # Create lock to prevent multiple executions
+    if ! create_lock; then
+        pid=$(cat "/tmp/docker-backup.lock/pid" 2>/dev/null || echo "unknown")
+        handle_error "Another instance of this script is already running (PID: $pid)"
     fi
-    echo $$ >"$LOCK_FILE"
 
     # Temporary file for email report
     EMAIL_TEMP_FILE=$(mktemp)
@@ -585,21 +603,18 @@ cleanup() {
         handle_error "Repository compaction failed"
     fi
 
-    # Remove lock files if they exist and no backup is running
-    if [ -f "/tmp/docker-backup.lock" ]; then
-        pid=$(cat "/tmp/docker-backup.lock")
-        if ! ps -p "$pid" >/dev/null; then
-            log "Removing stale lock file"
-            rm -f "/tmp/docker-backup.lock"
-        fi
-    fi
-
     log "Cleanup completed successfully"
 }
 
 # Function to download backup from Filen
 download_backup() {
     log "Starting download of backup repository from Filen"
+
+    # Create lock to prevent multiple executions
+    if ! create_lock; then
+        pid=$(cat "/tmp/docker-backup.lock/pid" 2>/dev/null || echo "unknown")
+        handle_error "Another instance of this script is already running (PID: $pid)"
+    fi
 
     # Check if Filen is available
     if ! command -v filen &>/dev/null; then
@@ -612,19 +627,6 @@ download_backup() {
     if [ ! -d "$temp_download_dir" ]; then
         handle_error "Unable to create temporary download directory"
     fi
-
-    # Create lock file to prevent multiple executions
-    LOCK_FILE="/tmp/docker-backup.lock"
-    if [ -e "$LOCK_FILE" ]; then
-        pid=$(cat "$LOCK_FILE")
-        if ps -p "$pid" >/dev/null; then
-            handle_error "Another instance of this script is already running (PID: $pid)"
-        else
-            log "Obsolete lock file detected, removing"
-            rm -f "$LOCK_FILE"
-        fi
-    fi
-    echo $ >"$LOCK_FILE"
 
     # Temporary file for email report
     EMAIL_TEMP_FILE=$(mktemp)
@@ -694,6 +696,9 @@ download_backup() {
 
     finish 0
 }
+
+# Trap signals for clean exit - setting this early
+trap 'handle_error "Script interrupted by signal"' INT TERM
 
 # Parameter analysis
 CONFIG_FILE=""
@@ -816,9 +821,6 @@ if [ ! -d "$BACKUP_DIR" ]; then
     fi
 fi
 
-# Trap signals for clean exit
-trap 'handle_error "Script interrupted by signal"' INT TERM
-
 # Execute the requested operation
 case "$OPERATION" in
 backup)
@@ -834,7 +836,7 @@ cleanup)
     cleanup
     ;;
 download)
-    download_backup "$ARCHIVE"
+    download_backup
     ;;
 *)
     handle_error "Unknown operation: $OPERATION"
