@@ -8,11 +8,12 @@ A robust Bash script for backing up Docker data directories using Borg backup wi
 - **Borg Backup Integration**: Uses Borg's powerful deduplication and compression
 - **Smart Retention Policy**: Configurable retention for daily, weekly, monthly, and yearly backups
 - **Remote Synchronization**: Optional synchronization to remote storage using Filen
+- **Download Capability**: Download repository directly from Filen remote storage
 - **Email Notifications**: Configurable email alerts for success and/or failure
 - **Progress Monitoring**: Interactive progress bar when running manually
 - **Error Handling**: Comprehensive error handling with automatic service recovery
 - **Resource Verification**: Checks for sufficient disk space before starting
-- **Lock Mechanism**: Prevents concurrent execution of multiple backup instances
+- **Directory-Based Lock Mechanism**: Prevents concurrent execution of multiple backup instances with improved atomicity
 - **Required Configuration File**: Ensures explicit configuration for safer operation
 
 ## Requirements
@@ -77,6 +78,12 @@ SHOW_PROGRESS=true    # Show progress bar
 SYNC_ENABLED=true     # Enable remote synchronization
 ```
 
+### Restore Configuration
+
+```bash
+RESTORE_TEMP_DIR="/tmp/docker-restore"  # Temporary directory for restore operations
+```
+
 ## Usage
 
 The script must be run with a configuration file:
@@ -92,6 +99,11 @@ OPTIONS:
   -c, --config FILE      Specify the configuration file (REQUIRED)
   --create-config FILE   Create a sample configuration file
   --show-config          Show active configuration and exit
+  --backup               Perform a backup (default action when no other action specified)
+  --restore ARCHIVE      Restore a specific backup archive
+  --list                 List available backup archives
+  --cleanup              Remove temporary files and enforce retention policy
+  --download             Download backup repository from Filen remote storage
   -h, --help             Show this help message
 ```
 
@@ -109,10 +121,34 @@ View current configuration:
 sudo ./docker-backup.sh -c /etc/docker-backup/config.conf --show-config
 ```
 
-Run the backup:
+Run a backup:
 
 ```bash
 sudo ./docker-backup.sh -c /etc/docker-backup/config.conf
+```
+
+List available backups:
+
+```bash
+sudo ./docker-backup.sh -c /etc/docker-backup/config.conf --list
+```
+
+Restore a specific backup:
+
+```bash
+sudo ./docker-backup.sh -c /etc/docker-backup/config.conf --restore docker-2023-05-15_02:00:00
+```
+
+Download backup repository from remote storage:
+
+```bash
+sudo ./docker-backup.sh -c /etc/docker-backup/config.conf --download
+```
+
+Clean up and enforce retention policy:
+
+```bash
+sudo ./docker-backup.sh -c /etc/docker-backup/config.conf --cleanup
 ```
 
 ## Scheduling with Cron
@@ -142,6 +178,7 @@ Common issues:
 - **Insufficient disk space**: Ensure the backup destination has enough free space
 - **Tool not found**: Install missing tools (borg, filen, msmtp)
 - **Docker not stopping**: Check Docker service status and dependencies
+- **Lock file exists**: If the script was interrupted abnormally, you might need to manually remove the lock directory at `/tmp/docker-backup.lock`
 - **Email notifications not working**: Verify SMTP settings and connectivity
 
 ## Security Notes
@@ -149,4 +186,6 @@ Common issues:
 - The script requires root privileges to stop and start Docker services
 - The configuration file permissions are set to 600 (readable only by owner) by default
 - SMTP passwords in the configuration file could be a security risk; consider using environment variables or secure credential storage
+- Temporary files containing sensitive information (like SMTP passwords) are created with strict permissions (600)
 - Ensure your backup directory has appropriate permissions
+- The lock mechanism uses a directory-based approach for improved atomicity
