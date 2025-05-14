@@ -438,7 +438,7 @@ perform_backup() {
     # Sync backup
     if [ "$SYNC_ENABLED" = true ]; then
         log "Syncing backup to remote storage: $REMOTE_DEST"
-        if ! /home/root/.filen-cli/bin/filen sync "$BACKUP_DIR":ltc:"$REMOTE_DEST"; then
+        if ! /root/.filen-cli/bin/filen sync "$BACKUP_DIR":ltc:"$REMOTE_DEST"; then
             handle_error "Remote storage sync failed"
         fi
     else
@@ -471,7 +471,7 @@ list_backups() {
     if [ "$SYNC_ENABLED" = true ] && command -v filen &>/dev/null; then
         echo ""
         echo "=== Remote Backups (Filen) ==="
-        /home/root/.filen-cli/bin/filen ls "$REMOTE_DEST"
+        /root/.filen-cli/bin/filen ls "$REMOTE_DEST"
     fi
 }
 
@@ -732,7 +732,7 @@ download_backup() {
 
     # Verify remote location exists
     log "Verifying remote backup location exists"
-    if ! /home/root/.filen-cli/bin/filen ls "$REMOTE_DEST" &>/dev/null; then
+    if ! /root/.filen-cli/bin/filen ls "$REMOTE_DEST" &>/dev/null; then
         handle_error "Remote backup location not found in Filen storage"
     fi
 
@@ -756,7 +756,7 @@ download_backup() {
 
     # Download the backup repository
     log "Downloading backup repository from remote storage"
-    if ! /home/root/.filen-cli/bin/filen download "$REMOTE_DEST" "$temp_download_dir"; then
+    if ! /root/.filen-cli/bin/filen download "$REMOTE_DEST" "$temp_download_dir"; then
         # Attempt to restore previous backup directory if download fails
         if [ -d "$backup_dir_backup" ]; then
             log "Restoring previous backup directory" "WARN"
