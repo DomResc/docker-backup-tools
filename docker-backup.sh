@@ -468,7 +468,7 @@ list_backups() {
     borg list "$BACKUP_DIR"
 
     # Check if Filen is enabled and available
-    if [ "$SYNC_ENABLED" = true ] && command -v filen &>/dev/null; then
+    if [ "$SYNC_ENABLED" = true ] && command -v /root/.filen-cli/bin/filen &>/dev/null; then
         echo ""
         echo "=== Remote Backups (Filen) ==="
         /root/.filen-cli/bin/filen ls "$REMOTE_DEST"
@@ -714,7 +714,7 @@ download_backup() {
     fi
 
     # Check if Filen is available
-    if ! command -v filen &>/dev/null; then
+    if ! command -v /root/.filen-cli/bin/filen &>/dev/null; then
         handle_error "Filen client not installed. Please install it to download backups."
     fi
 
@@ -901,7 +901,7 @@ for cmd in borg; do
 done
 
 # Check filen only if sync is enabled
-if [ "$SYNC_ENABLED" = true ] && ! command -v filen &>/dev/null; then
+if [ "$SYNC_ENABLED" = true ] && ! command -v /root/.filen-cli/bin/filen &>/dev/null; then
     handle_error "filen not found but required for sync. Please install it or disable sync."
 fi
 
