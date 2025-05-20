@@ -81,6 +81,9 @@ DOCKER_PRUNE_VOLUMES=false
 
 # Restore configuration
 RESTORE_TEMP_DIR="/tmp/docker-restore"
+
+# Filen CLI path
+FILEN_CLI_PATH="/root/.filen-cli/bin/filen"
 EOF
     echo "Sample configuration generated at: $1"
     echo "Edit this file according to your needs and then run:"
@@ -438,7 +441,7 @@ perform_backup() {
     # Sync backup
     if [ "$SYNC_ENABLED" = true ]; then
         log "Syncing backup to remote storage: $REMOTE_DEST"
-        if ! /root/.filen-cli/bin/filen sync "$BACKUP_DIR":ltc:"$REMOTE_DEST"; then
+        if ! "$FILEN_CLI_PATH" sync "$BACKUP_DIR":ltc:"$REMOTE_DEST"; then
             handle_error "Remote storage sync failed"
         fi
     else
@@ -468,10 +471,10 @@ list_backups() {
     borg list "$BACKUP_DIR"
 
     # Check if Filen is enabled and available
-    if [ "$SYNC_ENABLED" = true ] && command -v /root/.filen-cli/bin/filen &>/dev/null; then
+    if [ "$SYNC_ENABLED" = true ] && command -v "$FILEN_CLI_PATH" &>/dev/null; then
         echo ""
         echo "=== Remote Backups (Filen) ==="
-        /root/.filen-cli/bin/filen ls "$REMOTE_DEST"
+        "$FILEN_CLI_PATH" ls "$REMOTE_DEST"
     fi
 }
 
@@ -714,7 +717,7 @@ download_backup() {
     fi
 
     # Check if Filen is available
-    if ! command -v /root/.filen-cli/bin/filen &>/dev/null; then
+    if ! command -v "$FILEN_CLI_PATH" &>/dev/null; then
         handle_error "Filen client not installed. Please install it to download backups."
     fi
 
@@ -732,7 +735,7 @@ download_backup() {
 
     # Verify remote location exists
     log "Verifying remote backup location exists"
-    if ! /root/.filen-cli/bin/filen ls "$REMOTE_DEST" &>/dev/null; then
+    if ! "$FILEN_CLI_PATH" ls "$REMOTE_DEST" &>/dev/null; then
         handle_error "Remote backup location not found in Filen storage"
     fi
 
@@ -756,7 +759,7 @@ download_backup() {
 
     # Download the backup repository
     log "Downloading backup repository from remote storage"
-    if ! /root/.filen-cli/bin/filen download "$REMOTE_DEST" "$temp_download_dir"; then
+    if ! "$FILEN_CLI_PATH" download "$REMOTE_DEST" "$temp_download_dir"; then
         # Attempt to restore previous backup directory if download fails
         if [ -d "$backup_dir_backup" ]; then
             log "Restoring previous backup directory" "WARN"

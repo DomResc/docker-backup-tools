@@ -94,6 +94,12 @@ SYNC_ENABLED=true     # Enable remote synchronization
 RESTORE_TEMP_DIR="/tmp/docker-restore"  # Temporary directory for restore operations
 ```
 
+### Filen Configuration
+
+```bash
+FILEN_CLI_PATH="/root/.filen-cli/bin/filen"   # Path to the Filen CLI executable (change if not default)
+```
+
 ## Usage
 
 The script must be run with a configuration file:
